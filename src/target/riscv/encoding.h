@@ -2851,6 +2851,8 @@
 #define CSR_SIREG 0x151
 #define CSR_STOPEI 0x15c
 #define CSR_SATP 0x180
+#define CSR_SDCSR 0x182
+#define CSR_SDPC 0x183
 #define CSR_SCONTEXT 0x5a8
 #define CSR_VSSTATUS 0x200
 #define CSR_VSIE 0x204

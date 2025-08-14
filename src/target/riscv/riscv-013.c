@@ -67,6 +67,9 @@ static int register_write_direct(struct target *target, enum gdb_regno number,
 static int riscv013_access_memory(struct target *target, const riscv_mem_access_args_t args);
 static bool riscv013_get_impebreak(const struct target *target);
 static unsigned int riscv013_get_progbufsize(const struct target *target);
+static int riscv013_ack_security_faults(struct target *target);
+static int riscv013_get_debug_access_privilege(struct target *target);
+static enum gdb_regno riscv013_get_reg_addr_priv_aware(struct target *target, enum gdb_regno original_rid);
 
 typedef enum {
 	HALT_GROUP,
@@ -110,6 +113,8 @@ typedef enum {
 #define HART_INDEX_MULTIPLE	-1
 #define HART_INDEX_UNKNOWN	-2
 
+#define PRV_UNKNOWN -1
+
 typedef struct {
 	struct list_head list;
 	unsigned int abs_chain_position;
@@ -138,6 +143,10 @@ typedef struct {
 	 * abstractcs.busy may have remained set. In that case we may need to
 	 * re-check the busy state before executing these operations. */
 	bool abstract_cmd_maybe_busy;
+
+	/* RISC-V External Debug Security Extension support */
+	bool security_supported;   /* True if any connected hart supports Sdsec extension */
+
 } dm013_info_t;
 
 typedef struct {
@@ -257,6 +266,22 @@ typedef struct {
 
 	/* This hart was placed into a halt group in examine(). */
 	bool haltgroup_supported;
+
+	/* Security extension supported */
+	bool security_supported;
+
+	/* Halt request is pending */
+	bool halt_pending;
+
+	/* Timestamp when halt was requested for timeout tracking */
+	time_t halt_request_time;
+
+	/* Cached debug access privilege level (valid only when hart is halted) */
+	uint8_t cached_debug_privilege;
+	
+	/* Flag indicating if cached debug privilege is valid */
+	bool debug_privilege_cache_valid;
+
 } riscv013_info_t;
 
 static OOCD_LIST_HEAD(dm_list);
@@ -1891,6 +1916,17 @@ static int reset_dm(struct target *target)
 
 	LOG_TARGET_DEBUG(target, "DM successfully reset.");
 	dm->was_reset = true;
+	
+	/* Clear halt pending state for all targets connected to this DM */
+	target_list_t *entry;
+	list_for_each_entry(entry, &dm->target_list, list) {
+		struct target *t = entry->target;
+		riscv013_info_t *info_013 = get_info(t);
+		info_013->halt_pending = false;
+		/* Invalidate debug privilege cache for all targets */
+		info_013->debug_privilege_cache_valid = false;
+	}
+	
 	return ERROR_OK;
 }
 
@@ -2085,6 +2121,14 @@ static int examine(struct target *target)
 		return ERROR_FAIL;
 	}
 
+	/* Initialize security extension */
+	if (get_field(dmstatus, DM_DMSTATUS_ALLSECURED)) {
+		dm013_info_t *dm = get_dm(target);
+		dm->security_supported = true;
+		info->security_supported = true;
+		LOG_TARGET_DEBUG(target, "Security extension initialized for %d harts", dm->hart_count);
+	}
+
 	if (dm_read(target, &info->sbcs, DM_SBCS) != ERROR_OK)
 		return ERROR_FAIL;
 
@@ -2110,49 +2154,61 @@ static int examine(struct target *target)
 	/* Don't call any riscv_* functions until after we've counted the number of
 	 * cores and initialized registers. */
 
-	enum riscv_hart_state state_at_examine_start;
-	if (riscv_get_hart_state(target, &state_at_examine_start) != ERROR_OK)
-		return ERROR_FAIL;
-
 	RISCV_INFO(r);
-	const bool hart_halted_at_examine_start = state_at_examine_start == RISCV_STATE_HALTED;
-	if (!hart_halted_at_examine_start) {
-		r->prepped = true;
-		if (riscv013_halt_go(target) != ERROR_OK) {
-			LOG_TARGET_ERROR(target, "Fatal: Hart %d failed to halt during %s",
-					info->index, __func__);
+
+
+	if ( PRV_UNKNOWN == riscv013_get_debug_access_privilege(target)) {
+		/* When the hart is in a debug-disabled state, we can't read the debug privilege level,
+		 * so we just initialize the register cache without examining the register. 
+		 */
+		LOG_TARGET_DEBUG(target, "The harts may be in a debug-disabled state, just initialize the register cache without examining.");
+		riscv013_reg_init_cache(target);
+
+	} else {
+
+		enum riscv_hart_state state_at_examine_start;
+		if (riscv_get_hart_state(target, &state_at_examine_start) != ERROR_OK)
 			return ERROR_FAIL;
+
+		const bool hart_halted_at_examine_start = state_at_examine_start == RISCV_STATE_HALTED;
+		if (!hart_halted_at_examine_start) {
+			r->prepped = true;
+			if (riscv013_halt_go(target) != ERROR_OK) {
+				LOG_TARGET_ERROR(target, "Fatal: Hart %d failed to halt during %s",
+						info->index, __func__);
+				return ERROR_FAIL;
+			}
 		}
-	}
 
-	target->state = TARGET_HALTED;
-	target->debug_reason = hart_halted_at_examine_start ? DBG_REASON_UNDEFINED : DBG_REASON_DBGRQ;
-
-	result = riscv013_reg_examine_all(target);
-	if (result != ERROR_OK)
-		return result;
-
-	if (set_dcsr_ebreak(target, false) != ERROR_OK)
-		return ERROR_FAIL;
-
-	if (state_at_examine_start == RISCV_STATE_RUNNING) {
-		riscv013_step_or_resume_current_hart(target, false);
-		target->state = TARGET_RUNNING;
-		target->debug_reason = DBG_REASON_NOTHALTED;
-	} else if (state_at_examine_start == RISCV_STATE_HALTED) {
 		target->state = TARGET_HALTED;
-		target->debug_reason = DBG_REASON_UNDEFINED;
-	}
+		target->debug_reason = hart_halted_at_examine_start ? DBG_REASON_UNDEFINED : DBG_REASON_DBGRQ;
 
-	if (target->smp) {
-		if (set_group(target, &info->haltgroup_supported, target->smp, HALT_GROUP) != ERROR_OK)
+		result = riscv013_reg_examine_all(target);
+		if (result != ERROR_OK)
+			return result;
+
+		if (set_dcsr_ebreak(target, false) != ERROR_OK)
 			return ERROR_FAIL;
-		if (info->haltgroup_supported)
-			LOG_TARGET_INFO(target, "Core %d made part of halt group %d.", info->index,
-					target->smp);
-		else
-			LOG_TARGET_INFO(target, "Core %d could not be made part of halt group %d.",
-					info->index, target->smp);
+
+		if (state_at_examine_start == RISCV_STATE_RUNNING) {
+			riscv013_step_or_resume_current_hart(target, false);
+			target->state = TARGET_RUNNING;
+			target->debug_reason = DBG_REASON_NOTHALTED;
+		} else if (state_at_examine_start == RISCV_STATE_HALTED) {
+			target->state = TARGET_HALTED;
+			target->debug_reason = DBG_REASON_UNDEFINED;
+		}
+
+		if (target->smp) {
+			if (set_group(target, &info->haltgroup_supported, target->smp, HALT_GROUP) != ERROR_OK)
+				return ERROR_FAIL;
+			if (info->haltgroup_supported)
+				LOG_TARGET_INFO(target, "Core %d made part of halt group %d.", info->index,
+						target->smp);
+			else
+				LOG_TARGET_INFO(target, "Core %d could not be made part of halt group %d.",
+						info->index, target->smp);
+		}
 	}
 
 	/* Some regression suites rely on seeing 'Examined RISC-V core' to know
@@ -2836,10 +2892,11 @@ static int handle_became_unavailable(struct target *target,
 
 static int tick(struct target *target)
 {
-	RISCV013_INFO(info);
-	if (!info->dcsr_ebreak_is_set &&
-			target->state == TARGET_RUNNING &&
-			target_was_examined(target))
+	//RISCV013_INFO(info);
+	//if (!info->dcsr_ebreak_is_set &&
+	//		target->state == TARGET_RUNNING &&
+	//		target_was_examined(target))
+	if (false)
 		return halt_set_dcsr_ebreak(target);
 	return ERROR_OK;
 }
@@ -2881,6 +2938,9 @@ static int init_target(struct command_context *cmd_ctx,
 	generic_info->handle_became_unavailable = &handle_became_unavailable;
 	generic_info->tick = &tick;
 
+	/* RISC-V debug privilege and security extension support */
+	generic_info->ack_security_faults = &riscv013_ack_security_faults;
+
 	if (!generic_info->version_specific) {
 		generic_info->version_specific = calloc(1, sizeof(riscv013_info_t));
 		if (!generic_info->version_specific)
@@ -2893,6 +2953,14 @@ static int init_target(struct command_context *cmd_ctx,
 	reset_learned_delays(target);
 
 	info->ac_not_supported_cache = ac_cache_construct();
+	
+	/* Initialize halt management fields */
+	info->halt_pending = false;
+	info->halt_request_time = 0;
+
+	/* Initialize debug privilege cache */
+	info->debug_privilege_cache_valid = false;
+	info->cached_debug_privilege = PRV_UNKNOWN;
 
 	return ERROR_OK;
 }
@@ -3016,6 +3084,11 @@ static int deassert_reset(struct target *target)
 	if (result != ERROR_OK)
 		return result;
 
+	/* Clear halt pending state after reset completion */
+	info->halt_pending = false;
+	/* Invalidate debug privilege cache after reset completion */
+	info->debug_privilege_cache_valid = false;
+	
 	if (target->reset_halt) {
 		target->state = TARGET_HALTED;
 		target->debug_reason = DBG_REASON_DBGRQ;
@@ -5101,20 +5174,59 @@ int riscv013_get_register(struct target *target,
 	 * `dcsr[5]` is `dcsr.v` in current spec, but it is `dcsr.debugint` in 0.11.
 	 */
 	if (rid == GDB_REGNO_PRIV) {
+		/* Use privilege-aware DCSR access for PRIV register */
+		enum gdb_regno dcsr_addr = riscv013_get_reg_addr_priv_aware(target, GDB_REGNO_DCSR);
+		if (dcsr_addr == GDB_REGNO_UNKNOWN) {
+			LOG_TARGET_ERROR(target, "Cannot access dcsr for PRIV register: no appropriate dcsr register available");
+			return ERROR_FAIL;
+		}
 		uint64_t dcsr;
-		if (riscv_reg_get(target, &dcsr, GDB_REGNO_DCSR) != ERROR_OK)
+		if (register_read_direct(target, &dcsr, dcsr_addr) != ERROR_OK)
 			return ERROR_FAIL;
 		*value = set_field(0, VIRT_PRIV_V, get_field(dcsr, CSR_DCSR_V));
 		*value = set_field(*value, VIRT_PRIV_PRV, get_field(dcsr, CSR_DCSR_PRV));
 		return ERROR_OK;
 	}
 
-	LOG_TARGET_DEBUG(target, "reading register %s",	riscv_reg_gdb_regno_name(target, rid));
+	/* Privilege-aware register access redirection */
+	enum gdb_regno actual_rid = riscv013_get_reg_addr_priv_aware(target, rid);
+	if (actual_rid == GDB_REGNO_UNKNOWN) {
+		RISCV_INFO(r);
+		switch (r->secure_reg_behavior) {
+		case RISCV_SECURE_REG_ERROR:
+			LOG_TARGET_ERROR(target, "Cannot access register %s: debug access not allowed or register not available",
+				riscv_reg_gdb_regno_name(target, rid));
+			*value = -1;
+			return ERROR_FAIL;
+		case RISCV_SECURE_REG_ZERO:
+			LOG_TARGET_DEBUG(target, "Register %s access denied, returning 0",
+				riscv_reg_gdb_regno_name(target, rid));
+			*value = 0;
+			return ERROR_OK;
+		case RISCV_SECURE_REG_SKIP:
+			LOG_TARGET_DEBUG(target, "Register %s access denied, marking as non-existent",
+				riscv_reg_gdb_regno_name(target, rid));
+			*value = 0;
+			return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+		default:
+			LOG_TARGET_ERROR(target, "Invalid secure register behavior configuration");
+			*value = -1;
+			return ERROR_FAIL;
+		}
+	}
+	
+	if (actual_rid != rid) {
+		LOG_TARGET_DEBUG(target, "Redirecting %s access to %s (privilege-aware)",
+			riscv_reg_gdb_regno_name(target, rid),
+			riscv_reg_gdb_regno_name(target, actual_rid));
+	}
+
+	LOG_TARGET_DEBUG(target, "reading register %s",	riscv_reg_gdb_regno_name(target, actual_rid));
 
 	if (dm013_select_target(target) != ERROR_OK)
 		return ERROR_FAIL;
 
-	if (register_read_direct(target, value, rid) != ERROR_OK) {
+	if (register_read_direct(target, value, actual_rid) != ERROR_OK) {
 		*value = -1;
 		return ERROR_FAIL;
 	}
@@ -5125,13 +5237,43 @@ int riscv013_get_register(struct target *target,
 int riscv013_set_register(struct target *target, enum gdb_regno rid,
 		riscv_reg_t value)
 {
+	/* Privilege-aware register access redirection */
+	enum gdb_regno actual_rid = riscv013_get_reg_addr_priv_aware(target, rid);
+	if (actual_rid == GDB_REGNO_UNKNOWN) {
+		RISCV_INFO(r);
+		switch (r->secure_reg_behavior) {
+		case RISCV_SECURE_REG_ERROR:
+			LOG_TARGET_ERROR(target, "Cannot access register %s: debug access not allowed or register not available",
+				riscv_reg_gdb_regno_name(target, rid));
+			return ERROR_FAIL;
+		case RISCV_SECURE_REG_ZERO:
+			LOG_TARGET_DEBUG(target, "Register %s write access denied, ignoring write",
+				riscv_reg_gdb_regno_name(target, rid));
+			return ERROR_OK;
+		case RISCV_SECURE_REG_SKIP:
+			LOG_TARGET_DEBUG(target, "Register %s write access denied, marking as non-existent",
+				riscv_reg_gdb_regno_name(target, rid));
+			return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+		default:
+			LOG_TARGET_ERROR(target, "Invalid secure register behavior configuration");
+			return ERROR_FAIL;
+		}
+	}
+	
+	/* Log redirection if register was changed */
+	if (actual_rid != rid) {
+		LOG_TARGET_DEBUG(target, "Redirecting %s access to %s",
+			riscv_reg_gdb_regno_name(target, rid),
+			riscv_reg_gdb_regno_name(target, actual_rid));
+	}
+
 	LOG_TARGET_DEBUG(target, "writing 0x%" PRIx64 " to register %s",
-			value, riscv_reg_gdb_regno_name(target, rid));
+			value, riscv_reg_gdb_regno_name(target, actual_rid));
 
 	if (dm013_select_target(target) != ERROR_OK)
 		return ERROR_FAIL;
 
-	return register_write_direct(target, rid, value);
+	return register_write_direct(target, actual_rid, value);
 }
 
 static int dm013_select_hart(struct target *target, int hart_index)
@@ -5236,6 +5378,94 @@ static int riscv013_halt_go(struct target *target)
 	if (!dm)
 		return ERROR_FAIL;
 
+	RISCV013_INFO(info);
+
+	/* Check if any harts have pending halt requests */
+	bool any_pending = false;
+	time_t current_time = time(NULL);
+	
+	if (dm->current_hartid == HART_INDEX_MULTIPLE) {
+		/* Check all selected harts for pending halts */
+		target_list_t *entry;
+		list_for_each_entry(entry, &dm->target_list, list) {
+			struct target *t = entry->target;
+			riscv013_info_t *info_013 = get_info(t);
+			if (info_013->halt_pending) {
+				any_pending = true;
+				/* Reset timestamp on timeout, keep pending flag */
+				if ((current_time - info_013->halt_request_time) >= riscv_get_command_timeout_sec()) {
+					info_013->halt_request_time = current_time;
+				}
+			}
+		}
+	} else {
+		/* Check single hart for pending halt */
+		if (info->halt_pending) {
+			any_pending = true;
+			/* Reset timestamp on timeout, keep pending flag */
+			if ((current_time - info->halt_request_time) >= riscv_get_command_timeout_sec()) {
+				info->halt_request_time = current_time;
+			}
+		}
+	}
+	
+	/* If any harts have pending halts, wait for all to complete */
+	if (any_pending) {
+		LOG_TARGET_ERROR(target, "Halt already pending, waiting for completion");
+		time_t wait_start = time(NULL);
+		
+		do {
+			bool all_halted = true;
+			
+			if (dm->current_hartid == HART_INDEX_MULTIPLE) {
+				/* Check all selected harts */
+				target_list_t *entry;
+				list_for_each_entry(entry, &dm->target_list, list) {
+					struct target *t = entry->target;
+					RISCV013_INFO(t_info);
+					if (t_info->halt_pending) {
+						enum riscv_hart_state state;
+						if (riscv013_get_hart_state(t, &state) != ERROR_OK)
+							return ERROR_FAIL;
+							
+						if (state == RISCV_STATE_HALTED) {
+							t_info->halt_pending = false;
+							if (t->debug_reason == DBG_REASON_NOTHALTED)
+								t->debug_reason = DBG_REASON_DBGRQ;
+						} else {
+							all_halted = false;
+						}
+					}
+				}
+			} else {
+				/* Check single hart */
+				if (info->halt_pending) {
+					enum riscv_hart_state state;
+					if (riscv013_get_hart_state(target, &state) != ERROR_OK)
+						return ERROR_FAIL;
+						
+					if (state == RISCV_STATE_HALTED) {
+						info->halt_pending = false;
+						if (target->debug_reason == DBG_REASON_NOTHALTED)
+							target->debug_reason = DBG_REASON_DBGRQ;
+					} else {
+						all_halted = false;
+					}
+				}
+			}
+			
+			if (all_halted)
+				target->state = TARGET_HALTED;
+				return ERROR_OK;
+				
+			usleep(10000); /* 10ms */
+			
+		} while ((time(NULL) - wait_start) < riscv_get_command_timeout_sec());
+		
+		/* Timed out waiting - keep pending flags set */
+		return ERROR_TIMEOUT_REACHED;
+	}
+
 	if (select_prepped_harts(target) != ERROR_OK)
 		return ERROR_FAIL;
 
@@ -5250,14 +5480,34 @@ static int riscv013_halt_go(struct target *target)
 	uint32_t dmcontrol = DM_DMCONTROL_DMACTIVE | DM_DMCONTROL_HALTREQ;
 	dmcontrol = set_dmcontrol_hartsel(dmcontrol, dm->current_hartid);
 	dm_write(target, DM_DMCONTROL, dmcontrol);
+	
+	/* Mark halt as pending and record timestamp for timeout tracking */
+	time_t halt_time = time(NULL);
+	if (dm->current_hartid == HART_INDEX_MULTIPLE) {
+		target_list_t *entry;
+		list_for_each_entry(entry, &dm->target_list, list) {
+			struct target *t = entry->target;
+			riscv013_info_t *info_013 = get_info(t);
+			info_013->halt_pending = true;
+			info_013->halt_request_time = halt_time;
+		}
+	} else {
+		info->halt_pending = true;
+		info->halt_request_time = halt_time;
+	}
+	
 	uint32_t dmstatus;
-	for (size_t i = 0; i < 256; ++i) {
+	do {
 		if (dmstatus_read(target, &dmstatus, true) != ERROR_OK)
 			return ERROR_FAIL;
+		
 		/* When no harts are running, there's no point in continuing this loop. */
 		if (!get_field(dmstatus, DM_DMSTATUS_ANYRUNNING))
 			break;
-	}
+			
+		usleep(10000); /* 10ms */
+		
+	} while ((time(NULL) - halt_time) < riscv_get_command_timeout_sec());
 
 	/* We declare success if no harts are running. One or more of them may be
 	 * unavailable, though. */
@@ -5266,13 +5516,27 @@ static int riscv013_halt_go(struct target *target)
 		if (dm_read(target, &dmcontrol, DM_DMCONTROL) != ERROR_OK)
 			return ERROR_FAIL;
 
-		LOG_TARGET_ERROR(target, "Unable to halt. dmcontrol=0x%08x, dmstatus=0x%08x",
-				  dmcontrol, dmstatus);
-		return ERROR_FAIL;
+		LOG_TARGET_ERROR(target, "Halt request timed out after %ds. dmcontrol=0x%08x, dmstatus=0x%08x."
+					"The request will still be pending till acknowleged by target.",
+				  riscv_get_command_timeout_sec(), dmcontrol, dmstatus);
+		/* Keep halt_pending true - don't clear on timeout */
+		return ERROR_TIMEOUT_REACHED;
 	}
 
 	dmcontrol = set_field(dmcontrol, DM_DMCONTROL_HALTREQ, 0);
 	dm_write(target, DM_DMCONTROL, dmcontrol);
+	
+	/* Clear halt pending flag - halt completed successfully */
+	if (dm->current_hartid == HART_INDEX_MULTIPLE) {
+		target_list_t *entry;
+		list_for_each_entry(entry, &dm->target_list, list) {
+			struct target *t = entry->target;
+			riscv013_info_t *info_013 = get_info(t);
+			info_013->halt_pending = false;
+		}
+	} else {
+		info->halt_pending = false;
+	}
 
 	if (dm->current_hartid == HART_INDEX_MULTIPLE) {
 		target_list_t *entry;
@@ -5481,6 +5745,10 @@ static int riscv013_step_or_resume_current_hart(struct target *target,
 	LOG_TARGET_DEBUG(target, "resuming (operation=%s)",
 		step ? "single-step" : "resume");
 
+	/* Invalidate debug privilege cache when resuming */
+	RISCV013_INFO(info);
+	info->debug_privilege_cache_valid = false;
+
 	if (riscv_reg_flush_all(target) != ERROR_OK)
 		return ERROR_FAIL;
 
@@ -5548,4 +5816,146 @@ static int riscv013_clear_abstract_error(struct target *target)
 	if (dm_write(target, DM_ABSTRACTCS, DM_ABSTRACTCS_CMDERR) != ERROR_OK)
 		result = ERROR_FAIL;
 	return result;
+}
+
+/* Simple function to acknowledge security faults caused by ndreset via DMCS2.ACKSECFAULT */
+static int riscv013_ack_security_faults(struct target *target)
+{
+	dm013_info_t *dm = get_dm(target);
+	if (!dm || !dm->security_supported)
+		return ERROR_FAIL;
+	
+	/* Write 1 to ACKSECFAULT to clear security fault status */
+	return dm_write(target, DM_DMCS2, DM_DMCS2_ACKSECFAULT);
+}
+
+/* Get the current debug access privilege level for this hart */
+static int riscv013_get_debug_access_privilege(struct target *target)
+{
+	// FIXME: need to consider the effective access privilege for ld/st
+	dm013_info_t *dm = get_dm(target);
+	if (!dm || !dm->security_supported)
+		return PRV_M; /* M-mode privilege when security disabled */
+	
+	RISCV013_INFO(info);
+	
+	/* Check if hart is halted - can only read status registers when halted */
+	if (target->state != TARGET_HALTED) {
+		LOG_TARGET_DEBUG(target, "Hart is not halted, cannot determine debug access privilege");
+		info->debug_privilege_cache_valid = false; /* Invalidate cache when not halted */
+		return PRV_UNKNOWN; /* M-mode privilege when hart is not halted */
+	}
+	
+	/* Return cached value if available and valid */
+	if (info->debug_privilege_cache_valid) {
+		LOG_TARGET_DEBUG(target, "Using cached debug access privilege: %d", info->cached_debug_privilege);
+		return info->cached_debug_privilege;
+	}
+	
+	/* Cache is invalid, determine privilege level by probing registers */
+	uint8_t debug_priv = PRV_UNKNOWN;
+	
+	/* Try to read mstatus first - if readable, we have M-mode privilege */
+	riscv_reg_t mstatus_value;
+	if (register_read_direct(target, &mstatus_value, GDB_REGNO_MSTATUS) == ERROR_OK) {
+		LOG_TARGET_DEBUG(target, "Successfully read mstatus, debug access at M-mode privilege");
+		debug_priv = PRV_M;
+	} else {
+		/* mstatus not readable, try sstatus - if readable, we have S-mode privilege */
+		riscv_reg_t sstatus_value;
+		if (register_read_direct(target, &sstatus_value, GDB_REGNO_SSTATUS) == ERROR_OK) {
+			LOG_TARGET_DEBUG(target, "Successfully read sstatus, debug access at S-mode privilege");
+			debug_priv = PRV_S;
+		} else {
+			/* Neither mstatus nor sstatus readable - debug access not allowed */
+			LOG_TARGET_DEBUG(target, "Cannot read mstatus or sstatus, debug access may be restricted for all privileges");
+			debug_priv = PRV_UNKNOWN; /* Error: privilege level cannot be determined */
+		}
+	}
+	
+	/* Cache the determined privilege level */
+	info->cached_debug_privilege = debug_priv;
+	info->debug_privilege_cache_valid = true;
+	
+	return debug_priv;
+}
+
+/* 
+* When security extension is enabled, the M-mode CSR may not be accessible. The function redirect the access to the S-mode CSR,
+* when debug is disallowed in M-mode.
+*/ 
+static enum gdb_regno riscv013_get_reg_addr_priv_aware(struct target *target, enum gdb_regno original_rid)
+{
+	int debug_priv = riscv013_get_debug_access_privilege(target);
+
+	if (debug_priv == PRV_UNKNOWN) {
+		return GDB_REGNO_UNKNOWN;
+	}
+	
+	switch (original_rid) {
+		case GDB_REGNO_MSTATUS:
+			if (debug_priv == PRV_M) {
+				return GDB_REGNO_MSTATUS; /* M-mode privilege */
+			} else if (debug_priv == PRV_S) {
+				return GDB_REGNO_SSTATUS; /* S-mode privilege */
+			} else {
+				return GDB_REGNO_UNKNOWN; /* Invalid - debug not allowed */
+			}
+			break;
+		case GDB_REGNO_DCSR:
+			switch (debug_priv) {
+				case PRV_M:
+					/* M-mode debug access - use DCSR */
+					return GDB_REGNO_DCSR;
+				case PRV_S:
+					/* S-mode debug access - use SDCSR (S-mode shadow) */
+					return GDB_REGNO_SDCSR;
+				case PRV_UNKNOWN:
+				default:
+					/* Debug access not available */
+					return GDB_REGNO_UNKNOWN;
+			}
+			break;
+		case GDB_REGNO_DPC:
+			switch (debug_priv) {
+				case PRV_M:
+					/* M-mode debug access - use DPC */
+					return GDB_REGNO_DPC;
+				case PRV_S:
+					/* S-mode debug access - use SDPC (S-mode shadow) */
+					return GDB_REGNO_SDPC;
+				case PRV_UNKNOWN:
+				default:
+					/* Debug access not available */
+					return GDB_REGNO_UNKNOWN;
+			}
+			break;
+		case GDB_REGNO_MEPC:
+			if (debug_priv == PRV_S) 
+				return GDB_REGNO_SEPC;
+			else if (debug_priv == PRV_M) 
+				return GDB_REGNO_MEPC;
+			else 
+				return GDB_REGNO_UNKNOWN;
+			break;
+		case GDB_REGNO_MTVAL:
+			if (debug_priv == PRV_S) 
+				return GDB_REGNO_STVAL;
+			else if (debug_priv == PRV_M) 
+				return GDB_REGNO_MTVAL;
+			else 
+				return GDB_REGNO_UNKNOWN;
+			break;
+		case GDB_REGNO_MCAUSE:
+			if (debug_priv == PRV_S) 
+				return GDB_REGNO_SCAUSE;
+			else if (debug_priv == PRV_M) 
+				return GDB_REGNO_MCAUSE;
+			else 
+				return GDB_REGNO_UNKNOWN;
+			break;
+		default:
+			/* No redirection needed for this register */
+			return original_rid;
+	}
 }

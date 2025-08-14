@@ -13,7 +13,13 @@
  */
 
 /**
- * This function assumes target is halted.
+ * Initialize the register cache for the target without examining the target.
+ * This should be called early during target setup.
+ */
+int riscv013_reg_init_cache(struct target *target);
+
+/**
+ * This function assumes target is halted and register cache is initialized.
  * After this function all registers can be safely accessed via functions
  * described here and in `riscv_reg.h`.
  */

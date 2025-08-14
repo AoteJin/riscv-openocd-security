@@ -66,6 +66,12 @@ typedef enum riscv_virt2phys_mode {
 	RISCV_VIRT2PHYS_MODE_OFF
 } riscv_virt2phys_mode_t;
 
+enum riscv_secure_reg_behavior {
+	RISCV_SECURE_REG_ERROR,	/* Return error on access denied (default) */
+	RISCV_SECURE_REG_ZERO,	/* Return 0 on access denied */
+	RISCV_SECURE_REG_SKIP	/* Mark register as non-existent on access denied */
+};
+
 const char *riscv_virt2phys_mode_to_str(riscv_virt2phys_mode_t mode);
 
 enum riscv_halt_reason {
@@ -309,6 +315,9 @@ struct riscv_info {
 
 	COMMAND_HELPER((*print_info), struct target *target);
 
+	/* RISC-V debug privilege and security extension support */
+	int (*ack_security_faults)(struct target *target);
+
 	/* Storage for arch_info of non-custom registers. */
 	riscv_reg_info_t shared_reg_info;
 
@@ -365,6 +374,9 @@ struct riscv_info {
 	bool wp_allow_ge_lt_trigger;
 
 	bool autofence;
+
+	/* Behavior when register access is denied due to security restrictions */
+	enum riscv_secure_reg_behavior secure_reg_behavior;
 };
 
 enum riscv_priv_mode {

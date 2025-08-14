@@ -257,11 +257,24 @@ static int examine_misa(struct target *target)
 	int res = init_cache_entry(target, GDB_REGNO_MISA);
 	if (res != ERROR_OK)
 		return res;
-
-	res = riscv_reg_get(target, &r->misa, GDB_REGNO_MISA);
-	if (res != ERROR_OK)
-		return res;
-	return check_misa_mxl(target);
+	
+	riscv_reg_t misa_value;
+	res = riscv_reg_get(target, &misa_value, GDB_REGNO_MISA);
+	if (res != ERROR_OK) {
+		if (r->misa == 0) {
+			LOG_TARGET_ERROR(target, "MISA register not readable due to security restrictions. "
+					"Use 'riscv set_misa <value>' command to manually specify the ISA.");
+			return ERROR_FAIL;
+		} else {
+			/* If r->misa is non-zero, it was set manually via command, so use that value */
+			LOG_TARGET_DEBUG(target, "Using manually set MISA value: 0x%" PRIx64, r->misa);
+		}
+	} else {
+		r->misa = misa_value;
+	}
+	
+	check_misa_mxl(target);
+	return ERROR_OK;
 }
 
 static int examine_mtopi(struct target *target)
@@ -290,6 +303,60 @@ static int examine_mtopi(struct target *target)
 }
 
 /**
+ * Initialize the register cache for the target without examining the target.
+ * This should be called early during target setup.
+ */
+int riscv013_reg_init_cache(struct target *target)
+{
+	int res = riscv_reg_impl_init_cache(target);
+	if (res != ERROR_OK)
+		return res;
+
+	init_shared_reg_info(target);
+
+	// Assume those register exist to proceed the init process
+	res = assume_reg_exist(target, GDB_REGNO_MISA);
+	if (res != ERROR_OK)
+		return res;
+	res = assume_reg_exist(target, GDB_REGNO_VLENB);
+	if (res != ERROR_OK)
+		return res;
+	res = assume_reg_exist(target, GDB_REGNO_MTOPI);
+	if (res != ERROR_OK)
+		return res;
+	res = assume_reg_exist(target, GDB_REGNO_MTOPEI);
+	if (res != ERROR_OK)
+		return res;
+
+	RISCV_INFO(r);
+
+	/* If XLEN was manually set via command, skip auto-detection */
+	if (-1 == r->xlen) {
+		LOG_TARGET_ERROR(target, "XLEN is not set, cannot initialize the register cache "
+					"Use 'riscv set_xlen <value>' command to manually specify the XLEN.");
+		return ERROR_FAIL;
+	}
+	
+	if (r->misa == 0) {
+		LOG_TARGET_ERROR(target, "MISA register not readable due to security restrictions. "
+				"Use 'riscv set_misa <value>' command to manually specify the ISA.");
+	}
+
+	for (uint32_t regno = 0; regno < target->reg_cache->num_regs; ++regno) {
+		res = init_cache_entry(target, regno);
+		if (res != ERROR_OK)
+			return res;
+	}
+
+	res = riscv_reg_impl_expose_csrs(target);
+	if (res != ERROR_OK)
+		return res;
+	riscv_reg_impl_hide_csrs(target);
+
+	return ERROR_OK;
+}
+
+/**
  * This function assumes target's DM to be initialized (target is able to
  * access DMs registers, execute program buffer, etc.)
  */
@@ -300,7 +367,6 @@ int riscv013_reg_examine_all(struct target *target)
 		return res;
 
 	init_shared_reg_info(target);
-
 	assert(target->state == TARGET_HALTED);
 
 	res = examine_xlen(target);

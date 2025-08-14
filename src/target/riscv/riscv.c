@@ -2472,10 +2472,12 @@ static int old_or_new_riscv_step(struct target *target, bool current,
 static int riscv_examine(struct target *target)
 {
 	LOG_TARGET_DEBUG(target, "Starting examination");
-	if (target_was_examined(target)) {
-		LOG_TARGET_DEBUG(target, "Target was already examined.");
-		return ERROR_OK;
-	}
+
+	/* Remove the target_was_examined check to allow re-examination */
+//	if (target_was_examined(target)) {
+//		LOG_TARGET_DEBUG(target, "Target was already examined.");
+//		return ERROR_OK;
+//	}
 
 	/* Don't need to select dbus, since the first thing we do is read dtmcontrol. */
 
@@ -5588,6 +5590,233 @@ COMMAND_HANDLER(handle_riscv_virt2phys_mode)
 	return ERROR_OK;
 }
 
+COMMAND_HANDLER(riscv_handle_security)
+{
+	struct target *target = get_current_target(CMD_CTX);
+
+	if (!target) {
+		LOG_ERROR("No target selected");
+		return ERROR_FAIL;
+	}
+
+	RISCV_INFO(r);
+
+	if (CMD_ARGC < 1) {
+		command_print(CMD, "Available security commands for %s:", target_name(target));
+		command_print(CMD, "  riscv security status    - Show which harts support security extension");
+		command_print(CMD, "  riscv security faults    - Show current security fault states");
+		command_print(CMD, "  riscv security ack_faults - Clear/acknowledge active security faults");
+		return ERROR_OK;
+	}
+
+	if (CMD_ARGC != 1) {
+		LOG_ERROR("Command takes 0 or 1 argument");
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+
+	if (strcmp(CMD_ARGV[0], "status") == 0) {
+		/* Read and display security status (allsecured/anysecured) */
+		uint32_t dmstatus;
+		if (r->dmi_read(target, &dmstatus, DM_DMSTATUS) != ERROR_OK) {
+			command_print(CMD, "Failed to read dmstatus register");
+			return ERROR_FAIL;
+		}
+
+		bool any_secured = get_field(dmstatus, DM_DMSTATUS_ANYSECURED) != 0;
+		bool all_secured = get_field(dmstatus, DM_DMSTATUS_ALLSECURED) != 0;
+
+		command_print(CMD, "Security extension status for %s:", target_name(target));
+		
+		if (all_secured) {
+			command_print(CMD, "  All selected harts support security extension");
+		} else if (any_secured) {
+			command_print(CMD, "  Some selected harts support security extension");
+		} else {
+			command_print(CMD, "  No selected harts support security extension");
+		}
+		
+		command_print(CMD, "  Raw dmstatus: 0x%08x (anysecured=%d, allsecured=%d)", 
+			dmstatus, any_secured ? 1 : 0, all_secured ? 1 : 0);
+		return ERROR_OK;
+
+	} else if (strcmp(CMD_ARGV[0], "faults") == 0) {
+		/* Read and display security fault states */
+		uint32_t dmstatus;
+		if (r->dmi_read(target, &dmstatus, DM_DMSTATUS) != ERROR_OK) {
+			command_print(CMD, "Failed to read dmstatus register");
+			return ERROR_FAIL;
+		}
+
+		bool any_sec_fault = get_field(dmstatus, DM_DMSTATUS_ANYSECFAULT) != 0;
+		bool all_sec_fault = get_field(dmstatus, DM_DMSTATUS_ALLSECFAULT) != 0;
+
+		command_print(CMD, "Security fault status for %s:", target_name(target));
+		
+		if (all_sec_fault) {
+			command_print(CMD, "  All selected harts have active security faults");
+		} else if (any_sec_fault) {
+			command_print(CMD, "  Some selected harts have active security faults");
+		} else {
+			command_print(CMD, "  No security faults detected on selected harts");
+		}
+		
+		command_print(CMD, "  Raw dmstatus: 0x%08x (anysecfault=%d, allsecfault=%d)", 
+			dmstatus, any_sec_fault ? 1 : 0, all_sec_fault ? 1 : 0);
+		return ERROR_OK;
+
+	} else if (strcmp(CMD_ARGV[0], "ack_faults") == 0) {
+		/* Acknowledge security faults */
+		if (!r->ack_security_faults) {
+			command_print(CMD, "Security fault acknowledgment not supported");
+			return ERROR_FAIL;
+		}
+
+		if (r->ack_security_faults(target) == ERROR_OK) {
+			command_print(CMD, "Security faults acknowledged");
+
+			/* Verify the acknowledgment worked by reading dmstatus */
+			uint32_t dmstatus;
+			if (r->dmi_read(target, &dmstatus, DM_DMSTATUS) == ERROR_OK) {
+				bool any_sec_fault = get_field(dmstatus, DM_DMSTATUS_ANYSECFAULT) != 0;
+				
+				if (any_sec_fault) {
+					command_print(CMD, "Warning: Security faults still active after acknowledgment");
+					command_print(CMD, "  Some harts still have unacknowledged security faults");
+				} else {
+					command_print(CMD, "Success: All security faults have been cleared");
+				}
+				
+				command_print(CMD, "  Raw dmstatus: 0x%08x", dmstatus);
+			}
+		} else {
+			command_print(CMD, "Failed to acknowledge security faults");
+			return ERROR_FAIL;
+		}
+		return ERROR_OK;
+
+	} else {
+		command_print(CMD, "Unknown security command: %s", CMD_ARGV[0]);
+		command_print(CMD, "Use: status, faults, or ack_faults");
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+}
+
+COMMAND_HANDLER(riscv_set_misa)
+{
+	struct target *target = get_current_target(CMD_CTX);
+
+	if (!target) {
+		LOG_ERROR("No target selected");
+		return ERROR_FAIL;
+	}
+
+	RISCV_INFO(r);
+	if (!r) {
+		LOG_ERROR("RISC-V target info not available");
+		return ERROR_FAIL;
+	}
+
+	if (CMD_ARGC != 1) {
+		LOG_ERROR("Command takes exactly one argument: the MISA value");
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+
+	/* Parse the MISA value from the command argument */
+	uint64_t misa_value;
+	COMMAND_PARSE_NUMBER(u64, CMD_ARGV[0], misa_value);
+
+	/* Set the MISA value in the target structure */
+	r->misa = misa_value;
+
+	command_print(CMD, "MISA manually set to 0x%016" PRIx64 " for target %s " 
+			"the value may be overwritten if misa is readable by the target.",
+		misa_value, target_name(target));
+
+	LOG_TARGET_INFO(target, "MISA manually configured: 0x%016" PRIx64 , 
+		misa_value );
+
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(riscv_set_secure_reg_behavior)
+{
+	struct target *target = get_current_target(CMD_CTX);
+
+	if (!target) {
+		LOG_ERROR("No target selected");
+		return ERROR_FAIL;
+	}
+
+	RISCV_INFO(r);
+	if (!r) {
+		LOG_ERROR("RISC-V target info not available");
+		return ERROR_FAIL;
+	}
+
+	if (CMD_ARGC != 1) {
+		command_print(CMD, "Current secure register behavior: %s",
+			(r->secure_reg_behavior == RISCV_SECURE_REG_ERROR) ? "error" :
+			(r->secure_reg_behavior == RISCV_SECURE_REG_ZERO) ? "zero" : "skip");
+		command_print(CMD, "Usage: riscv set_secure_reg_behavior [error|zero|skip]");
+		return ERROR_OK;
+	}
+
+	if (strcmp(CMD_ARGV[0], "error") == 0) {
+		r->secure_reg_behavior = RISCV_SECURE_REG_ERROR;
+		command_print(CMD, "Secure register behavior set to: error (return ERROR_FAIL)");
+	} else if (strcmp(CMD_ARGV[0], "zero") == 0) {
+		r->secure_reg_behavior = RISCV_SECURE_REG_ZERO;
+		command_print(CMD, "Secure register behavior set to: zero (return 0 with success)");
+	} else if (strcmp(CMD_ARGV[0], "skip") == 0) {
+		r->secure_reg_behavior = RISCV_SECURE_REG_SKIP;
+		command_print(CMD, "Secure register behavior set to: skip (mark as non-existent)");
+	} else {
+		command_print(CMD, "Invalid behavior '%s'. Valid options: error, zero, skip", CMD_ARGV[0]);
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+
+	LOG_TARGET_INFO(target, "Secure register behavior configured: %s", CMD_ARGV[0]);
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(riscv_set_xlen)
+{
+	struct target *target = get_current_target(CMD_CTX);
+
+	if (!target) {
+		LOG_ERROR("No target selected");
+		return ERROR_FAIL;
+	}
+
+	RISCV_INFO(r);
+	if (!r) {
+		LOG_ERROR("RISC-V target info not available");
+		return ERROR_FAIL;
+	}
+
+	if (CMD_ARGC != 1) {
+		command_print(CMD, "Current XLEN: %d", r->xlen);
+		command_print(CMD, "Usage: riscv set_xlen [32|64]");
+		return ERROR_OK;
+	}
+
+	int xlen = atoi(CMD_ARGV[0]);
+	if (xlen != 32 && xlen != 64) {
+		command_print(CMD, "Error: XLEN must be either 32 or 64");
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+	}
+
+	/* Set the XLEN value */
+	r->xlen = xlen;
+	
+	command_print(CMD, "XLEN manually set to %d for target %s", 
+		xlen, target_name(target));
+	
+	LOG_TARGET_INFO(target, "XLEN manually configured: %d", xlen);
+
+	return ERROR_OK;
+}
+
 static const struct command_registration riscv_exec_command_handlers[] = {
 	{
 		.name = "dump_sample_buf",
@@ -5630,6 +5859,31 @@ static const struct command_registration riscv_exec_command_handlers[] = {
 		.mode = COMMAND_ANY,
 		.usage = "sec",
 		.help = "DEPRECATED. Use 'riscv set_command_timeout_sec' instead."
+	},
+	{
+		.name = "set_misa",
+		.handler = riscv_set_misa,
+		.mode = COMMAND_ANY,
+		.usage = "value",
+		.help = "Manually set MISA register value when it's not readable due to security restrictions. "
+	},
+	{
+		.name = "set_secure_reg_behavior",
+		.handler = riscv_set_secure_reg_behavior,
+		.mode = COMMAND_ANY,
+		.usage = "[error|zero|skip]",
+		.help = "Set behavior when register access is denied due to security restrictions. "
+			"'error': return ERROR_FAIL (default), 'zero': return 0 with success, "
+			"'skip': mark register as non-existent."
+	},
+	{
+		.name = "set_xlen",
+		.handler = riscv_set_xlen,
+		.mode = COMMAND_ANY,
+		.usage = "[32|64]",
+		.help = "Manually set XLEN (register width) for the target. "
+			"This overrides the automatic detection and is useful for secure environments "
+			"where register probing may not work reliably."
 	},
 	{
 		.name = "set_mem_access",
@@ -5850,6 +6104,16 @@ static const struct command_registration riscv_exec_command_handlers[] = {
 			"When off, users need to take care of memory coherency themselves, for example by using "
 			"`riscv exec_progbuf` to execute fence or CMO instructions."
 	},
+	{
+		.name = "security",
+		.handler = riscv_handle_security,
+		.mode = COMMAND_ANY,
+		.usage = "[status|faults|ack_faults]",
+		.help = "Access RISC-V Debug Security Extension (Sdsec) information."
+			"status - show security extension support status, "
+			"faults - show current security fault states, "
+			"ack_faults - acknowledge/clear active security faults."
+	},
 	COMMAND_REGISTRATION_DONE
 };
 
@@ -5970,6 +6234,9 @@ static void riscv_info_init(struct target *target, struct riscv_info *r)
 	r->virt2phys_mode = RISCV_VIRT2PHYS_MODE_SW;
 
 	r->isrmask_mode = RISCV_ISRMASK_OFF;
+
+	/* Default to error behavior for secure register access */
+	r->secure_reg_behavior = RISCV_SECURE_REG_ERROR;
 
 	r->mem_access_methods[0] = RISCV_MEM_ACCESS_PROGBUF;
 	r->mem_access_methods[1] = RISCV_MEM_ACCESS_SYSBUS;

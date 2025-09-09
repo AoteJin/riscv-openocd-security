@@ -95,6 +95,10 @@
 #define DCSR_CAUSE_HALT     5
 #define DCSR_CAUSE_GROUP    6
 
+/* SDCSR (S-mode Debug Control and Status Register) bit definitions */
+/* DMPRV field reuses the same bit position as MPRVEN in DCSR (bit 4) */
+#define SDCSR_DMPRV         (1<<4)
+
 #define MCONTROL_TYPE(xlen)    (0xfULL<<((xlen)-4))
 #define MCONTROL_DMODE(xlen)   (1ULL<<((xlen)-5))
 #define MCONTROL_MASKMAX(xlen) (0x3fULL<<((xlen)-11))

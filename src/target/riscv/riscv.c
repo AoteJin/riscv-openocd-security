@@ -3017,6 +3017,13 @@ static int riscv_effective_privilege_mode(struct target *target, int *v_mode, in
 
 static int riscv_mmu(struct target *target, int *enabled)
 {
+	/* Check if target has its own mmu implementation */
+	struct target_type *tt = get_target_type(target);
+	if (tt && tt->mmu && tt->mmu != riscv_mmu) {
+		return tt->mmu(target, enabled);
+	}
+
+	/* Use generic RISC-V implementation */
 	*enabled = 0;
 
 	if (!riscv_virt2phys_mode_is_sw(target))
@@ -3316,6 +3323,13 @@ static int riscv_virt2phys_v(struct target *target, target_addr_t virtual, targe
 
 static int riscv_virt2phys(struct target *target, target_addr_t virtual, target_addr_t *physical)
 {
+	/* Check if target has its own virt2phys implementation */
+	struct target_type *tt = get_target_type(target);
+	if (tt && tt->virt2phys && tt->virt2phys != riscv_virt2phys) {
+		return tt->virt2phys(target, virtual, physical);
+	}
+
+	/* Use generic RISC-V implementation */
 	int enabled;
 	if (riscv_mmu(target, &enabled) != ERROR_OK)
 		return ERROR_FAIL;
@@ -3390,6 +3404,13 @@ static int check_virt_memory_access(struct target *target, target_addr_t address
 static int riscv_read_phys_memory(struct target *target, target_addr_t phys_address,
 			uint32_t size, uint32_t count, uint8_t *buffer)
 {
+	/* Check if target has its own read_phys_memory implementation */
+	struct target_type *tt = get_target_type(target);
+	if (tt && tt->read_phys_memory && tt->read_phys_memory != riscv_read_phys_memory) {
+		return tt->read_phys_memory(target, phys_address, size, count, buffer);
+	}
+
+	/* Use generic RISC-V implementation */
 	const riscv_mem_access_args_t args = {
 		.address = phys_address,
 		.read_buffer = buffer,
@@ -3404,6 +3425,13 @@ static int riscv_read_phys_memory(struct target *target, target_addr_t phys_addr
 static int riscv_write_phys_memory(struct target *target, target_addr_t phys_address,
 			uint32_t size, uint32_t count, const uint8_t *buffer)
 {
+	/* Check if target has its own write_phys_memory implementation */
+	struct target_type *tt = get_target_type(target);
+	if (tt && tt->write_phys_memory && tt->write_phys_memory != riscv_write_phys_memory) {
+		return tt->write_phys_memory(target, phys_address, size, count, buffer);
+	}
+
+	/* Use generic RISC-V implementation */
 	const riscv_mem_access_args_t args = {
 		.address = phys_address,
 		.write_buffer = buffer,
@@ -3479,6 +3507,13 @@ static int riscv_rw_memory(struct target *target, const riscv_mem_access_args_t 
 static int riscv_read_memory(struct target *target, target_addr_t address,
 		uint32_t size, uint32_t count, uint8_t *buffer)
 {
+	/* Check if target has its own read_memory implementation */
+	struct target_type *tt = get_target_type(target);
+	if (tt && tt->read_memory && tt->read_memory != riscv_read_memory) {
+		return tt->read_memory(target, address, size, count, buffer);
+	}
+
+	/* Use generic RISC-V implementation */
 	const riscv_mem_access_args_t args = {
 		.address = address,
 		.read_buffer = buffer,
@@ -3493,6 +3528,13 @@ static int riscv_read_memory(struct target *target, target_addr_t address,
 static int riscv_write_memory(struct target *target, target_addr_t address,
 		uint32_t size, uint32_t count, const uint8_t *buffer)
 {
+	/* Check if target has its own write_memory implementation */
+	struct target_type *tt = get_target_type(target);
+	if (tt && tt->write_memory && tt->write_memory != riscv_write_memory) {
+		return tt->write_memory(target, address, size, count, buffer);
+	}
+
+	/* Use generic RISC-V implementation */
 	const riscv_mem_access_args_t args = {
 		.address = address,
 		.write_buffer = buffer,

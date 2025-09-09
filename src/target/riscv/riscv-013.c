@@ -5148,6 +5148,83 @@ static int arch_state(struct target *target)
 	return ERROR_OK;
 }
 
+/* Memory access functions with debug privilege checking */
+static int riscv013_read_memory(struct target *target, target_addr_t address,
+		uint32_t size, uint32_t count, uint8_t *buffer)
+{
+	/* Check memory access privilege before proceeding */
+	int memory_priv = riscv013_get_memory_access_privilege(target);
+	if (memory_priv == PRV_UNKNOWN) {
+		LOG_TARGET_ERROR(target, "Memory read denied: debug access disallowed for all privilege levels");
+		return ERROR_FAIL;
+	}
+	
+	LOG_TARGET_DEBUG(target, "Memory read allowed with privilege level %d", memory_priv);
+	
+	/* Call the standard RISC-V memory read function */
+	return riscv_read_memory(target, address, size, count, buffer);
+}
+
+static int riscv013_write_memory(struct target *target, target_addr_t address,
+		uint32_t size, uint32_t count, const uint8_t *buffer)
+{
+	/* Check memory access privilege before proceeding */
+	int memory_priv = riscv013_get_memory_access_privilege(target);
+	if (memory_priv == PRV_UNKNOWN) {
+		LOG_TARGET_ERROR(target, "Memory write denied: debug access disallowed for all privilege levels");
+		return ERROR_FAIL;
+	}
+	
+	LOG_TARGET_DEBUG(target, "Memory write allowed with privilege level %d", memory_priv);
+	
+	/* Call the standard RISC-V memory write function */
+	return riscv_write_memory(target, address, size, count, buffer);
+}
+
+static int riscv013_read_phys_memory(struct target *target, target_addr_t phys_address,
+		uint32_t size, uint32_t count, uint8_t *buffer)
+{
+	/* Check memory access privilege before proceeding */
+	int memory_priv = riscv013_get_memory_access_privilege(target);
+	if (memory_priv == PRV_UNKNOWN) {
+		LOG_TARGET_ERROR(target, "Physical memory read denied: debug access disallowed for all privilege levels");
+		return ERROR_FAIL;
+	}
+	
+	LOG_TARGET_DEBUG(target, "Physical memory read allowed with privilege level %d", memory_priv);
+	
+	/* Call the standard RISC-V physical memory read function */
+	return riscv_read_phys_memory(target, phys_address, size, count, buffer);
+}
+
+static int riscv013_write_phys_memory(struct target *target, target_addr_t phys_address,
+		uint32_t size, uint32_t count, const uint8_t *buffer)
+{
+	/* Check memory access privilege before proceeding */
+	int memory_priv = riscv013_get_memory_access_privilege(target);
+	if (memory_priv == PRV_UNKNOWN) {
+		LOG_TARGET_ERROR(target, "Physical memory write denied: debug access disallowed for all privilege levels");
+		return ERROR_FAIL;
+	}
+	
+	LOG_TARGET_DEBUG(target, "Physical memory write allowed with privilege level %d", memory_priv);
+	
+	/* Call the standard RISC-V physical memory write function */
+	return riscv_write_phys_memory(target, phys_address, size, count, buffer);
+}
+
+static int riscv013_mmu(struct target *target, int *enabled)
+{
+	/* Call the standard RISC-V MMU function */
+	return riscv_mmu(target, enabled);
+}
+
+static int riscv013_virt2phys(struct target *target, target_addr_t virtual, target_addr_t *physical)
+{
+	/* Call the standard RISC-V virt2phys function */
+	return riscv_virt2phys(target, virtual, physical);
+}
+
 struct target_type riscv013_target = {
 	.name = "riscv",
 
@@ -5161,6 +5238,14 @@ struct target_type riscv013_target = {
 
 	.assert_reset = assert_reset,
 	.deassert_reset = deassert_reset,
+
+	.read_memory = riscv013_read_memory,
+	.write_memory = riscv013_write_memory,
+	.read_phys_memory = riscv013_read_phys_memory,
+	.write_phys_memory = riscv013_write_phys_memory,
+
+	.mmu = riscv013_mmu,
+	.virt2phys = riscv013_virt2phys,
 
 	.arch_state = arch_state
 };

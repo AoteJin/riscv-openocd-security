@@ -2126,6 +2126,9 @@ static int examine(struct target *target)
 		dm013_info_t *dm = get_dm(target);
 		dm->security_supported = true;
 		info->security_supported = true;
+		LOG_TARGET_DEBUG(target, "Security extension mandates HW virtual-to-physical memory address translation.");
+		RISCV_INFO(r);
+		r->virt2phys_mode = RISCV_VIRT2PHYS_MODE_HW;
 		LOG_TARGET_DEBUG(target, "Security extension initialized for %d harts", dm->hart_count);
 	}
 
@@ -5153,7 +5156,7 @@ static int riscv013_read_memory(struct target *target, target_addr_t address,
 		uint32_t size, uint32_t count, uint8_t *buffer)
 {
 	/* Check memory access privilege before proceeding */
-	int memory_priv = riscv013_get_memory_access_privilege(target);
+	int memory_priv = riscv013_get_debug_access_privilege(target);
 	if (memory_priv == PRV_UNKNOWN) {
 		LOG_TARGET_ERROR(target, "Memory read denied: debug access disallowed for all privilege levels");
 		return ERROR_FAIL;
@@ -5161,15 +5164,22 @@ static int riscv013_read_memory(struct target *target, target_addr_t address,
 	
 	LOG_TARGET_DEBUG(target, "Memory read allowed with privilege level %d", memory_priv);
 	
-	/* Call the standard RISC-V memory read function */
-	return riscv_read_memory(target, address, size, count, buffer);
+	const riscv_mem_access_args_t args = {
+		.address = address,
+		.read_buffer = buffer,
+		.size = size,
+		.count = count,
+		.increment = size,
+	};
+
+	return riscv013_access_memory(target, args);
 }
 
 static int riscv013_write_memory(struct target *target, target_addr_t address,
 		uint32_t size, uint32_t count, const uint8_t *buffer)
 {
 	/* Check memory access privilege before proceeding */
-	int memory_priv = riscv013_get_memory_access_privilege(target);
+	int memory_priv = riscv013_get_debug_access_privilege(target);
 	if (memory_priv == PRV_UNKNOWN) {
 		LOG_TARGET_ERROR(target, "Memory write denied: debug access disallowed for all privilege levels");
 		return ERROR_FAIL;
@@ -5177,52 +5187,147 @@ static int riscv013_write_memory(struct target *target, target_addr_t address,
 	
 	LOG_TARGET_DEBUG(target, "Memory write allowed with privilege level %d", memory_priv);
 	
-	/* Call the standard RISC-V memory write function */
-	return riscv_write_memory(target, address, size, count, buffer);
+	const riscv_mem_access_args_t args = {
+		.address = address,
+		.write_buffer = buffer,
+		.size = size,
+		.count = count,
+		.increment = size,
+	};
+
+	return riscv013_access_memory(target, args);
 }
 
 static int riscv013_read_phys_memory(struct target *target, target_addr_t phys_address,
 		uint32_t size, uint32_t count, uint8_t *buffer)
 {
 	/* Check memory access privilege before proceeding */
-	int memory_priv = riscv013_get_memory_access_privilege(target);
+	int memory_priv = riscv013_get_debug_access_privilege(target);
 	if (memory_priv == PRV_UNKNOWN) {
 		LOG_TARGET_ERROR(target, "Physical memory read denied: debug access disallowed for all privilege levels");
 		return ERROR_FAIL;
 	}
 	
-	LOG_TARGET_DEBUG(target, "Physical memory read allowed with privilege level %d", memory_priv);
+	/* M-mode naturally has physical access */
+	if (memory_priv == PRV_M) {
+		LOG_TARGET_DEBUG(target, "Physical memory read allowed with M-mode privilege");
+		const riscv_mem_access_args_t args = {
+			.address = phys_address,
+			.read_buffer = buffer,
+			.size = size,
+			.count = count,
+			.increment = size,
+		};
+		return riscv013_access_memory(target, args);
+	}
 	
-	/* Call the standard RISC-V physical memory read function */
-	return riscv_read_phys_memory(target, phys_address, size, count, buffer);
+	/* S-mode needs SATP save/restore to achieve physical access */
+	if (memory_priv == PRV_S) {
+		LOG_TARGET_DEBUG(target, "Physical memory read with S-mode privilege - disabling MMU temporarily");
+		
+		/* Save current SATP value */
+		riscv_reg_t satp_orig;
+		if (riscv_reg_get(target, &satp_orig, GDB_REGNO_SATP) != ERROR_OK) {
+			LOG_TARGET_ERROR(target, "Failed to read SATP register for S-mode physical access");
+			return ERROR_FAIL;
+		}
+		
+		/* Disable MMU by setting SATP.MODE to 0 (SATP_MODE_OFF) */
+		unsigned int xlen = riscv_xlen(target);
+		riscv_reg_t satp_disabled = satp_orig & ~RISCV_SATP_MODE(xlen);
+		if (riscv_reg_set(target, GDB_REGNO_SATP, satp_disabled) != ERROR_OK) {
+			LOG_TARGET_ERROR(target, "Failed to disable MMU via SATP for physical access");
+			return ERROR_FAIL;
+		}
+		
+		/* Perform physical memory access */
+		const riscv_mem_access_args_t args = {
+			.address = phys_address,
+			.read_buffer = buffer,
+			.size = size,
+			.count = count,
+			.increment = size,
+		};
+		int result = riscv013_access_memory(target, args);
+		
+		/* Restore original SATP value */
+		if (riscv_reg_set(target, GDB_REGNO_SATP, satp_orig) != ERROR_OK) {
+			LOG_TARGET_ERROR(target, "Failed to restore SATP register after physical access");
+			/* Continue with original result, but log the restore failure */
+		}
+		
+		return result;
+	}
+	
+	/* All other privilege levels cannot determine physical access capability */
+	LOG_TARGET_ERROR(target, "Physical memory read denied: debug access privilege level %d cannot determine physical access capability", memory_priv);
+	return ERROR_FAIL;
 }
 
 static int riscv013_write_phys_memory(struct target *target, target_addr_t phys_address,
 		uint32_t size, uint32_t count, const uint8_t *buffer)
 {
 	/* Check memory access privilege before proceeding */
-	int memory_priv = riscv013_get_memory_access_privilege(target);
+	int memory_priv = riscv013_get_debug_access_privilege(target);
 	if (memory_priv == PRV_UNKNOWN) {
 		LOG_TARGET_ERROR(target, "Physical memory write denied: debug access disallowed for all privilege levels");
 		return ERROR_FAIL;
 	}
 	
-	LOG_TARGET_DEBUG(target, "Physical memory write allowed with privilege level %d", memory_priv);
+	/* M-mode naturally has physical access */
+	if (memory_priv == PRV_M) {
+		LOG_TARGET_DEBUG(target, "Physical memory write allowed with M-mode privilege");
+		const riscv_mem_access_args_t args = {
+			.address = phys_address,
+			.write_buffer = buffer,
+			.size = size,
+			.count = count,
+			.increment = size,
+		};
+		return riscv013_access_memory(target, args);
+	}
 	
-	/* Call the standard RISC-V physical memory write function */
-	return riscv_write_phys_memory(target, phys_address, size, count, buffer);
-}
-
-static int riscv013_mmu(struct target *target, int *enabled)
-{
-	/* Call the standard RISC-V MMU function */
-	return riscv_mmu(target, enabled);
-}
-
-static int riscv013_virt2phys(struct target *target, target_addr_t virtual, target_addr_t *physical)
-{
-	/* Call the standard RISC-V virt2phys function */
-	return riscv_virt2phys(target, virtual, physical);
+	/* S-mode needs SATP save/restore to achieve physical access */
+	if (memory_priv == PRV_S) {
+		LOG_TARGET_DEBUG(target, "Physical memory write with S-mode privilege - disabling MMU temporarily");
+		
+		/* Save current SATP value */
+		riscv_reg_t satp_orig;
+		if (riscv_reg_get(target, &satp_orig, GDB_REGNO_SATP) != ERROR_OK) {
+			LOG_TARGET_ERROR(target, "Failed to read SATP register for S-mode physical access");
+			return ERROR_FAIL;
+		}
+		
+		/* Disable MMU by setting SATP.MODE to 0 (SATP_MODE_OFF) */
+		unsigned int xlen = riscv_xlen(target);
+		riscv_reg_t satp_disabled = satp_orig & ~RISCV_SATP_MODE(xlen);
+		if (riscv_reg_set(target, GDB_REGNO_SATP, satp_disabled) != ERROR_OK) {
+			LOG_TARGET_ERROR(target, "Failed to disable MMU via SATP for physical access");
+			return ERROR_FAIL;
+		}
+		
+		/* Perform physical memory access */
+		const riscv_mem_access_args_t args = {
+			.address = phys_address,
+			.write_buffer = buffer,
+			.size = size,
+			.count = count,
+			.increment = size,
+		};
+		int result = riscv013_access_memory(target, args);
+		
+		/* Restore original SATP value */
+		if (riscv_reg_set(target, GDB_REGNO_SATP, satp_orig) != ERROR_OK) {
+			LOG_TARGET_ERROR(target, "Failed to restore SATP register after physical access");
+			/* Continue with original result, but log the restore failure */
+		}
+		
+		return result;
+	}
+	
+	/* All other privilege levels cannot determine physical access capability */
+	LOG_TARGET_ERROR(target, "Physical memory write denied: privilege level %d cannot determine physical access capability", memory_priv);
+	return ERROR_FAIL;
 }
 
 struct target_type riscv013_target = {
@@ -5243,9 +5348,6 @@ struct target_type riscv013_target = {
 	.write_memory = riscv013_write_memory,
 	.read_phys_memory = riscv013_read_phys_memory,
 	.write_phys_memory = riscv013_write_phys_memory,
-
-	.mmu = riscv013_mmu,
-	.virt2phys = riscv013_virt2phys,
 
 	.arch_state = arch_state
 };

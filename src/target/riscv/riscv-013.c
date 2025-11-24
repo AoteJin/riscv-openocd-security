@@ -1658,14 +1658,18 @@ static int register_read_direct(struct target *target, riscv_reg_t *value,
 
 	riscv_reg_t mstatus;
 
+	LOG_TARGET_DEBUG(target, "Prepping for register access");
 	if (prep_for_register_access(target, &mstatus, number) != ERROR_OK)
 		return ERROR_FAIL;
 
+	LOG_TARGET_DEBUG(target, "Reading register abstract");
 	int result = register_read_abstract(target, value, number);
 
+	LOG_TARGET_DEBUG(target, "Reading register progbuf");
 	if (result != ERROR_OK && target->state == TARGET_HALTED)
 		result = register_read_progbuf(target, value, number);
 
+	LOG_TARGET_DEBUG(target, "Cleaning up after register access");
 	if (cleanup_after_register_access(target, mstatus, number) != ERROR_OK)
 		return ERROR_FAIL;
 
@@ -5374,6 +5378,14 @@ int riscv013_get_register(struct target *target,
 		*value = set_field(*value, VIRT_PRIV_PRV, get_field(dcsr, CSR_DCSR_PRV));
 		return ERROR_OK;
 	}
+	else if (rid == GDB_REGNO_DCSR || rid == GDB_REGNO_SDCSR || rid == GDB_REGNO_UDCSR) {
+		/* For DCSR, SDCSR, and UDCSR, read the value directly, because they are used to determine the debug access privilege */
+		if (register_read_direct(target, value, rid) != ERROR_OK) {
+			*value = -1;
+			return ERROR_FAIL;
+		}
+		return ERROR_OK;
+	}
 
 	/* Privilege-aware register access redirection */
 	enum gdb_regno actual_rid = riscv013_get_reg_addr_priv_aware(target, rid);
@@ -5765,6 +5777,13 @@ static int riscv013_halt_go(struct target *target)
 		}
 	}
 
+	// update the debug privilege cache
+	LOG_TARGET_DEBUG(target, "Updating debug privilege cache");
+	riscv013_get_debug_access_privilege(target);
+		result = riscv013_reg_examine_all(target);
+		if (result != ERROR_OK)
+			return result;
+
 	return ERROR_OK;
 }
 
@@ -6020,7 +6039,9 @@ static int riscv013_ack_security_faults(struct target *target)
 static int riscv013_get_debug_access_privilege(struct target *target)
 {
 	// FIXME: need to consider the effective access privilege for ld/st
+	// Note: Uses DCSR/SDCSR probing instead of MSTATUS/SSTATUS to avoid circular dependency
 	dm013_info_t *dm = get_dm(target);
+	LOG_TARGET_DEBUG(target, "dm->security_supported: %d", dm->security_supported);
 	if (!dm || !dm->security_supported)
 		return PRV_M; /* M-mode privilege when security disabled */
 	
@@ -6042,22 +6063,33 @@ static int riscv013_get_debug_access_privilege(struct target *target)
 	/* Cache is invalid, determine privilege level by probing registers */
 	uint8_t debug_priv = PRV_UNKNOWN;
 	
-	/* Try to read mstatus first - if readable, we have M-mode privilege */
-	riscv_reg_t mstatus_value;
-	if (register_read_direct(target, &mstatus_value, GDB_REGNO_MSTATUS) == ERROR_OK) {
-		LOG_TARGET_DEBUG(target, "Successfully read mstatus, debug access at M-mode privilege");
-		debug_priv = PRV_M;
-	} else {
-		/* mstatus not readable, try sstatus - if readable, we have S-mode privilege */
-		riscv_reg_t sstatus_value;
-		if (register_read_direct(target, &sstatus_value, GDB_REGNO_SSTATUS) == ERROR_OK) {
-			LOG_TARGET_DEBUG(target, "Successfully read sstatus, debug access at S-mode privilege");
-			debug_priv = PRV_S;
+	/* Check if abstract commands are available (datacount > 0) */
+	bool abstract_available = (info->datacount > 0);
+	LOG_TARGET_DEBUG(target, "Abstract command access %s (datacount=%d)", 
+			abstract_available ? "available" : "not available", info->datacount);
+	
+	if (abstract_available) {
+		/* Try to read DCSR first using abstract commands - if readable, we have M-mode privilege */
+		riscv_reg_t dcsr_value;
+		if (register_read_abstract(target, &dcsr_value, GDB_REGNO_DCSR) == ERROR_OK) {
+			LOG_TARGET_DEBUG(target, "Successfully read DCSR via abstract command, debug access at M-mode privilege");
+			debug_priv = PRV_M;
 		} else {
-			/* Neither mstatus nor sstatus readable - debug access not allowed */
-			LOG_TARGET_DEBUG(target, "Cannot read mstatus or sstatus, debug access may be restricted for all privileges");
-			debug_priv = PRV_UNKNOWN; /* Error: privilege level cannot be determined */
+			/* DCSR not readable, try SDCSR - if readable, we have S-mode privilege */
+			riscv_reg_t sdcsr_value;
+			if (register_read_abstract(target, &sdcsr_value, GDB_REGNO_SDCSR) == ERROR_OK) {
+				LOG_TARGET_DEBUG(target, "Successfully read SDCSR via abstract command, debug access at S-mode ov VS-mode privilege");
+				debug_priv = PRV_S;
+			} else {
+				/* Neither DCSR nor SDCSR readable - assume U-mode privilege */
+				LOG_TARGET_DEBUG(target, "Cannot read DCSR or SDCSR via abstract commands, assuming U-mode debug access privilege");
+				debug_priv = PRV_U; /* U-mode privilege when neither M-mode nor S-mode debug registers are accessible */
+			}
 		}
+	} else {
+		/* Abstract commands are not available - cannot determine privilege level reliably */
+		LOG_TARGET_WARNING(target, "Abstract commands not available (datacount=0), cannot determine debug access privilege level");
+		debug_priv = PRV_UNKNOWN; /* Cannot determine privilege level without abstract commands */
 	}
 	
 	/* Cache the determined privilege level */
@@ -6085,6 +6117,9 @@ static enum gdb_regno riscv013_get_reg_addr_priv_aware(struct target *target, en
 				return GDB_REGNO_MSTATUS; /* M-mode privilege */
 			} else if (debug_priv == PRV_S) {
 				return GDB_REGNO_SSTATUS; /* S-mode privilege */
+			} else if (debug_priv == PRV_U) {
+				/* U-mode doesn't have status register access - return unknown */
+				return GDB_REGNO_UNKNOWN; 
 			} else {
 				return GDB_REGNO_UNKNOWN; /* Invalid - debug not allowed */
 			}
@@ -6097,6 +6132,9 @@ static enum gdb_regno riscv013_get_reg_addr_priv_aware(struct target *target, en
 				case PRV_S:
 					/* S-mode debug access - use SDCSR (S-mode shadow) */
 					return GDB_REGNO_SDCSR;
+				case PRV_U:
+					/* U-mode debug access - use UDCSR (U-mode debug control register) */
+					return GDB_REGNO_UDCSR;
 				case PRV_UNKNOWN:
 				default:
 					/* Debug access not available */
@@ -6111,6 +6149,9 @@ static enum gdb_regno riscv013_get_reg_addr_priv_aware(struct target *target, en
 				case PRV_S:
 					/* S-mode debug access - use SDPC (S-mode shadow) */
 					return GDB_REGNO_SDPC;
+				case PRV_U:
+					/* U-mode debug access - use UDPC (U-mode debug program counter) */
+					return GDB_REGNO_UDPC;
 				case PRV_UNKNOWN:
 				default:
 					/* Debug access not available */
@@ -6118,26 +6159,35 @@ static enum gdb_regno riscv013_get_reg_addr_priv_aware(struct target *target, en
 			}
 			break;
 		case GDB_REGNO_MEPC:
-			if (debug_priv == PRV_S) 
-				return GDB_REGNO_SEPC;
-			else if (debug_priv == PRV_M) 
+			if (debug_priv == PRV_M) 
 				return GDB_REGNO_MEPC;
+			else if (debug_priv == PRV_S) 
+				return GDB_REGNO_SEPC;
+			else if (debug_priv == PRV_U)
+				/* U-mode doesn't have EPC register access */
+				return GDB_REGNO_UNKNOWN;
 			else 
 				return GDB_REGNO_UNKNOWN;
 			break;
 		case GDB_REGNO_MTVAL:
-			if (debug_priv == PRV_S) 
-				return GDB_REGNO_STVAL;
-			else if (debug_priv == PRV_M) 
+			if (debug_priv == PRV_M) 
 				return GDB_REGNO_MTVAL;
+			else if (debug_priv == PRV_S) 
+				return GDB_REGNO_STVAL;
+			else if (debug_priv == PRV_U)
+				/* U-mode doesn't have TVAL register access */
+				return GDB_REGNO_UNKNOWN;
 			else 
 				return GDB_REGNO_UNKNOWN;
 			break;
 		case GDB_REGNO_MCAUSE:
-			if (debug_priv == PRV_S) 
-				return GDB_REGNO_SCAUSE;
-			else if (debug_priv == PRV_M) 
+			if (debug_priv == PRV_M) 
 				return GDB_REGNO_MCAUSE;
+			else if (debug_priv == PRV_S) 
+				return GDB_REGNO_SCAUSE;
+			else if (debug_priv == PRV_U)
+				/* U-mode doesn't have CAUSE register access */
+				return GDB_REGNO_UNKNOWN;
 			else 
 				return GDB_REGNO_UNKNOWN;
 			break;

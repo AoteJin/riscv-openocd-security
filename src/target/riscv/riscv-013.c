@@ -3275,66 +3275,191 @@ static int read_sbcs_nonbusy(struct target *target, uint32_t *sbcs)
 }
 
 /* TODO: return struct mem_access_result */
-static int modify_privilege_for_virt2phys_mode(struct target *target, riscv_reg_t *mstatus, riscv_reg_t *mstatus_old,
-		riscv_reg_t *dcsr, riscv_reg_t *dcsr_old)
+static int modify_privilege_for_virt2phys_mode(struct target *target, 
+		riscv_reg_t *prv, riscv_reg_t *prv_old,
+		riscv_reg_t *v, riscv_reg_t *v_old,
+		riscv_reg_t *mprv_old,
+		riscv_reg_t *xdcsr, riscv_reg_t *xdcsr_old)
 {
-	assert(mstatus);
-	assert(mstatus_old);
-	assert(dcsr);
-	assert(dcsr_old);
+	assert(prv);
+	assert(prv_old);
+	assert(v);
+	assert(v_old);
+	assert(xdcsr);
+	assert(xdcsr_old);
 	if (!riscv_virt2phys_mode_is_hw(target))
 		return ERROR_OK;
 
-	/* Read and save DCSR */
-	if (riscv_reg_get(target, dcsr, GDB_REGNO_DCSR) != ERROR_OK)
+	/* Get the current debug access privilege level */
+	int debug_priv = riscv013_get_debug_access_privilege(target);
+	if (debug_priv == PRV_UNKNOWN) {
+		LOG_TARGET_ERROR(target, "Cannot determine debug access privilege for virt2phys mode");
 		return ERROR_FAIL;
-	*dcsr_old = *dcsr;
+	}
 
-	/* Read and save MSTATUS */
-	if (riscv_reg_get(target, mstatus, GDB_REGNO_MSTATUS) != ERROR_OK)
-		return ERROR_FAIL;
-	*mstatus_old = *mstatus;
+	/* Determine which registers to use based on debug access privilege */
+	enum gdb_regno dcsr_regno;
+	uint32_t prv_enable_field;
 
-	/* If we come from m-mode with mprv set, we want to keep mpp */
-	if (get_field(*dcsr, CSR_DCSR_PRV) == PRV_M)
+	if (debug_priv == PRV_M) {
+		/* M-mode debug access - use DCSR/MSTATUS */
+		dcsr_regno = GDB_REGNO_DCSR;
+		prv_enable_field = CSR_DCSR_MPRVEN;
+	} else if (debug_priv == PRV_S) {
+		/* S-mode debug access - use SDCSR/SSTATUS */
+		dcsr_regno = GDB_REGNO_SDCSR;
+		prv_enable_field = SDCSR_DMPRV;
+	} else {
+		/* U-mode or other - not supported for privilege modification */
+		LOG_TARGET_DEBUG(target, "Debug access privilege level %d does not support privilege modification", debug_priv);
 		return ERROR_OK;
+	}
 
-	/* mstatus.mpp <- dcsr.prv */
-	*mstatus = set_field(*mstatus, MSTATUS_MPP, get_field(*dcsr, CSR_DCSR_PRV));
-
-	/* mstatus.mprv <- 1 */
-	*mstatus = set_field(*mstatus, MSTATUS_MPRV, 1);
-
-	/* Write MSTATUS */
-	if (*mstatus != *mstatus_old &&
-			riscv_reg_set(target, GDB_REGNO_MSTATUS, *mstatus) != ERROR_OK)
+	/* Read and save debug control register (DCSR or SDCSR) */
+	if (riscv_reg_get(target, xdcsr, dcsr_regno) != ERROR_OK)
 		return ERROR_FAIL;
+	*xdcsr_old = *xdcsr;
 
-	/* dcsr.mprven <- 1 */
-	*dcsr = set_field(*dcsr, CSR_DCSR_MPRVEN, CSR_DCSR_MPRVEN_ENABLED);
+	/* Get current privilege from debug control register */
+	*prv = get_field(*xdcsr, CSR_DCSR_PRV);
+	*v = get_field(*xdcsr, CSR_DCSR_V);
 
-	/* Write DCSR */
-	if (*dcsr != *dcsr_old &&
-			riscv_reg_set(target, GDB_REGNO_DCSR, *dcsr) != ERROR_OK)
+	/* If we come from the same mode with privilege modification already set, we want to keep current setup */
+	if (debug_priv == PRV_M) {
+		riscv_reg_t mstatus;
+		riscv_reg_t mstatus_old;
+		if (riscv_reg_get(target, &mstatus, GDB_REGNO_MSTATUS) != ERROR_OK)
+			return ERROR_FAIL;
+		mstatus_old = mstatus;
+		*prv_old = get_field(mstatus, MSTATUS_MPP);
+		*v_old = get_field(mstatus, MSTATUS_MPV);
+		*mprv_old = get_field(mstatus, MSTATUS_MPRV);
+
+		/* Set MSTATUS.MPP <- dcsr.prv, MSTATUS.MPV <- dcsr.v, and MSTATUS.MPRV <- 1 */
+		mstatus = set_field(mstatus, MSTATUS_MPP, *prv);
+		mstatus = set_field(mstatus, MSTATUS_MPV, *v);
+		mstatus = set_field(mstatus, MSTATUS_MPRV, 1);
+	if (mstatus != mstatus_old &&
+			riscv_reg_set(target, GDB_REGNO_MSTATUS, mstatus) != ERROR_OK)
+		return ERROR_FAIL;
+	} else { /* PRV_S */
+		riscv_reg_t sstatus;
+		riscv_reg_t sstatus_old;
+		riscv_reg_t hstatus;
+		riscv_reg_t hstatus_old;
+
+		if (riscv_reg_get(target, &sstatus, GDB_REGNO_SSTATUS) != ERROR_OK)
+			return ERROR_FAIL;
+		sstatus_old = sstatus;
+		if (riscv_reg_get(target, &hstatus, GDB_REGNO_HSTATUS) != ERROR_OK)
+			return ERROR_FAIL;
+		hstatus_old = hstatus;
+
+		*prv_old = get_field(sstatus, SSTATUS_SPP);
+		*v_old = get_field(hstatus, HSTATUS_SPV);
+
+		/* Set SSTATUS.SPP <- dcsr.prv, HSTATUS.SPV <- dcsr.v, and HSTATUS.SPRV <- 1 */
+		sstatus = set_field(sstatus, SSTATUS_SPP, *prv);
+		hstatus = set_field(hstatus, HSTATUS_SPV, *v);
+
+		if (sstatus != sstatus_old &&
+			riscv_reg_set(target, GDB_REGNO_SSTATUS, sstatus) != ERROR_OK)
+			return ERROR_FAIL;
+		if (hstatus != hstatus_old &&
+			riscv_reg_set(target, GDB_REGNO_HSTATUS, hstatus) != ERROR_OK)
+			return ERROR_FAIL;
+	}
+
+
+	/* Enable privilege modification in debug control register */
+	*xdcsr = set_field(*xdcsr, prv_enable_field, 1);
+
+	/* Write debug control register */
+	if (*xdcsr != *xdcsr_old &&
+			riscv_reg_set(target, dcsr_regno, *xdcsr) != ERROR_OK)
 		return ERROR_FAIL;
 
 	return ERROR_OK;
 }
 
-static int restore_privilege_from_virt2phys_mode(struct target *target, riscv_reg_t mstatus, riscv_reg_t mstatus_old,
-		riscv_reg_t dcsr, riscv_reg_t dcsr_old)
+static int restore_privilege_from_virt2phys_mode(struct target *target, 
+		riscv_reg_t prv, riscv_reg_t prv_old,
+		riscv_reg_t v, riscv_reg_t v_old,
+		riscv_reg_t mprv_old,
+		riscv_reg_t xdcsr, riscv_reg_t xdcsr_old)
 {
 	if (!riscv_virt2phys_mode_is_hw(target))
 		return ERROR_OK;
 
-	/* Restore MSTATUS */
-	if (mstatus != mstatus_old &&
-			riscv_reg_set(target, GDB_REGNO_MSTATUS, mstatus_old) != ERROR_OK)
+	/* Get the current debug access privilege level */
+	int debug_priv = riscv013_get_debug_access_privilege(target);
+	if (debug_priv == PRV_UNKNOWN) {
+		LOG_TARGET_ERROR(target, "Cannot determine debug access privilege for virt2phys mode restore");
 		return ERROR_FAIL;
+	}
 
-	/* Restore DCSR */
-	if (dcsr != dcsr_old &&
-			riscv_reg_set(target, GDB_REGNO_DCSR, dcsr_old) != ERROR_OK)
+	/* Determine which registers to restore based on debug access privilege */
+	enum gdb_regno dcsr_regno;
+	
+	if (debug_priv == PRV_M) {
+		/* M-mode debug access - restore DCSR/MSTATUS */
+		dcsr_regno = GDB_REGNO_DCSR;
+		
+		/* Restore MSTATUS fields */
+		riscv_reg_t mstatus;
+		riscv_reg_t mstatus_old;
+		if (riscv_reg_get(target, &mstatus, GDB_REGNO_MSTATUS) != ERROR_OK)
+			return ERROR_FAIL;
+		mstatus_old = mstatus;
+
+		mstatus = set_field(mstatus, MSTATUS_MPP, prv_old);
+		mstatus = set_field(mstatus, MSTATUS_MPV, v_old);
+		mstatus = set_field(mstatus, MSTATUS_MPRV, mprv_old);
+		
+		if (mstatus != mstatus_old &&
+			riscv_reg_set(target, GDB_REGNO_MSTATUS, mstatus) != ERROR_OK)
+			return ERROR_FAIL;
+			
+	} else if (debug_priv == PRV_S) {
+		/* S-mode debug access - restore SDCSR/SSTATUS/HSTATUS */
+		dcsr_regno = GDB_REGNO_SDCSR;
+		
+		/* Restore SSTATUS.SPP */
+		riscv_reg_t sstatus;
+		riscv_reg_t sstatus_old;
+		if (riscv_reg_get(target, &sstatus, GDB_REGNO_SSTATUS) != ERROR_OK)
+			return ERROR_FAIL;
+		sstatus_old = sstatus;
+
+		
+		sstatus = set_field(sstatus, SSTATUS_SPP, prv_old);
+		
+		if (sstatus != sstatus_old &&
+			riscv_reg_set(target, GDB_REGNO_SSTATUS, sstatus) != ERROR_OK)
+			return ERROR_FAIL;
+		
+		/* Restore HSTATUS.SPV */
+		riscv_reg_t hstatus;
+		riscv_reg_t hstatus_old;
+		if (riscv_reg_get(target, &hstatus, GDB_REGNO_HSTATUS) != ERROR_OK)
+			return ERROR_FAIL;
+		hstatus_old = hstatus;
+
+		hstatus = set_field(hstatus, HSTATUS_SPV, v_old);
+		
+		if (hstatus != hstatus_old &&
+			riscv_reg_set(target, GDB_REGNO_HSTATUS, hstatus) != ERROR_OK)
+			return ERROR_FAIL;
+			
+	} else {
+		/* U-mode or other - nothing to restore */
+		LOG_TARGET_DEBUG(target, "Debug access privilege level %d does not require privilege restoration", debug_priv);
+		return ERROR_OK;
+	}
+
+	/* Restore debug control register (DCSR or SDCSR) */
+	if (xdcsr != xdcsr_old &&
+			riscv_reg_set(target, dcsr_regno, xdcsr_old) != ERROR_OK)
 		return ERROR_FAIL;
 
 	return ERROR_OK;
@@ -4560,12 +4685,15 @@ access_memory_progbuf(struct target *target, const riscv_mem_access_args_t args)
 	if (dm013_select_target(target) != ERROR_OK)
 		return mem_access_result(MEM_ACCESS_SKIPPED_TARGET_SELECT_FAILED);
 
-	riscv_reg_t mstatus = 0;
-	riscv_reg_t mstatus_old = 0;
-	riscv_reg_t dcsr = 0;
-	riscv_reg_t dcsr_old = 0;
+	riscv_reg_t prv = 0;
+	riscv_reg_t v = 0;
+	riscv_reg_t prv_old = 0;
+	riscv_reg_t v_old = 0;
+	riscv_reg_t xdcsr = 0;
+	riscv_reg_t xdcsr_old = 0;
+	riscv_reg_t mprv_old = 0;
 	if (modify_privilege_for_virt2phys_mode(target,
-			&mstatus, &mstatus_old, &dcsr, &dcsr_old) != ERROR_OK)
+			&prv, &prv_old, &v, &v_old, &mprv_old, &xdcsr, &xdcsr_old) != ERROR_OK)
 		return mem_access_result(MEM_ACCESS_SKIPPED_PRIV_MOD_FAILED);
 
 	struct mem_access_result result = is_read ?
@@ -4573,7 +4701,7 @@ access_memory_progbuf(struct target *target, const riscv_mem_access_args_t args)
 			write_memory_progbuf(target, args);
 
 	if (restore_privilege_from_virt2phys_mode(target,
-			mstatus, mstatus_old, dcsr, dcsr_old) != ERROR_OK)
+			prv, prv_old, v, v_old, mprv_old, xdcsr, xdcsr_old) != ERROR_OK)
 		return mem_access_result(MEM_ACCESS_FAILED_PRIV_MOD_FAILED);
 
 	return result;
@@ -4660,6 +4788,7 @@ riscv013_access_memory(struct target *target, const riscv_mem_access_args_t args
 		riscv_mem_access_method_t method = r->mem_access_methods[i];
 		switch (method) {
 			case RISCV_MEM_ACCESS_PROGBUF:
+				/* Program buffer access is the only one support virtual memory access for now*/
 				skip_reason[method] = access_memory_progbuf(target, args);
 				break;
 			case RISCV_MEM_ACCESS_SYSBUS:
@@ -5379,7 +5508,9 @@ int riscv013_get_register(struct target *target,
 		return ERROR_OK;
 	}
 	else if (rid == GDB_REGNO_DCSR || rid == GDB_REGNO_SDCSR || rid == GDB_REGNO_UDCSR) {
-		/* For DCSR, SDCSR, and UDCSR, read the value directly, because they are used to determine the debug access privilege */
+		/* For DCSR, SDCSR, and UDCSR, read the value directly, because they are used to determine the debug access privilege 
+		 * Alos, the fields in DCSR/SDCSR are not 1:1 mapped, thus must be explicitly accessed
+		 */
 		if (register_read_direct(target, value, rid) != ERROR_OK) {
 			*value = -1;
 			return ERROR_FAIL;
@@ -6036,10 +6167,12 @@ static int riscv013_ack_security_faults(struct target *target)
 }
 
 /* Get the current debug access privilege level for this hart */
+/* This function determins the debug access privilege level by probing the DCSR/SDCSR registers, 
+ * and it does not differentiate between S/VS or U/VU mode to unify the debugger implementation
+ * as much as possible.
+ */
 static int riscv013_get_debug_access_privilege(struct target *target)
 {
-	// FIXME: need to consider the effective access privilege for ld/st
-	// Note: Uses DCSR/SDCSR probing instead of MSTATUS/SSTATUS to avoid circular dependency
 	dm013_info_t *dm = get_dm(target);
 	LOG_TARGET_DEBUG(target, "dm->security_supported: %d", dm->security_supported);
 	if (!dm || !dm->security_supported)

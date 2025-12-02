@@ -107,6 +107,13 @@ static int assume_reg_exist(struct target *target, uint32_t regno)
 static int examine_xlen(struct target *target)
 {
 	RISCV_INFO(r);
+
+	/* If XLEN was manually set via command, skip auto-detection */
+	if (r->xlen != -1) {
+		LOG_TARGET_DEBUG(target, "XLEN manually set to %d, skipping auto-detection", r->xlen);
+		return ERROR_OK;
+	}
+
 	unsigned int cmderr;
 
 	const uint32_t command = riscv013_access_register_command(target,
@@ -373,28 +380,48 @@ int riscv013_reg_examine_all(struct target *target)
 	if (res != ERROR_OK)
 		return res;
 
-	/* Reading CSRs may clobber "s0", "s1", so it should be possible to
-	 * save them in cache. */
-	res = init_cache_entry(target, GDB_REGNO_S0);
+	res = init_cache_entry(target, GDB_REGNO_DPC);
 	if (res != ERROR_OK)
 		return res;
-	res = init_cache_entry(target, GDB_REGNO_S1);
-	if (res != ERROR_OK)
-		return res;
-
-	res = examine_misa(target);
+	res = init_cache_entry(target, GDB_REGNO_SDPC);
 	if (res != ERROR_OK)
 		return res;
 
-	res = examine_vlenb(target);
-	if (res != ERROR_OK)
-		return res;
+	riscv_reg_t prv = riscv013_get_debug_access_privilege(target);
 
-	riscv_reg_impl_init_vector_reg_type(target);
+	if (prv == PRV_M) {
+		/* Reading CSRs may clobber "s0", "s1", so it should be possible to
+		 * save them in cache. */
+		res = init_cache_entry(target, GDB_REGNO_S0);
+		if (res != ERROR_OK)
+			return res;
+		res = init_cache_entry(target, GDB_REGNO_S1);
+		if (res != ERROR_OK)
+			return res;
 
-	res = examine_mtopi(target);
-	if (res != ERROR_OK)
-		return res;
+		res = examine_misa(target);
+		if (res != ERROR_OK)
+			return res;
+
+		res = examine_vlenb(target);
+		if (res != ERROR_OK)
+			return res;
+
+		riscv_reg_impl_init_vector_reg_type(target);
+
+		res = examine_mtopi(target);
+		if (res != ERROR_OK)
+			return res;
+	} else {
+		/* If the target is not in machine mode, assume existence of the registers to false */
+		res = assume_reg_exist(target, GDB_REGNO_VLENB);
+		res = assume_reg_exist(target, GDB_REGNO_MTOPI);
+		res = assume_reg_exist(target, GDB_REGNO_MTOPEI);
+
+		riscv_reg_impl_set_exist(target, GDB_REGNO_VLENB, false);
+		riscv_reg_impl_set_exist(target, GDB_REGNO_MTOPI, false);
+		riscv_reg_impl_set_exist(target, GDB_REGNO_MTOPEI, false);
+	}
 
 	for (uint32_t regno = 0; regno < target->reg_cache->num_regs; ++regno) {
 		res = init_cache_entry(target, regno);

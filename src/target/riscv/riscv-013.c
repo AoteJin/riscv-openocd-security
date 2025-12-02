@@ -68,7 +68,6 @@ static int riscv013_access_memory(struct target *target, const riscv_mem_access_
 static bool riscv013_get_impebreak(const struct target *target);
 static unsigned int riscv013_get_progbufsize(const struct target *target);
 static int riscv013_ack_security_faults(struct target *target);
-static int riscv013_get_debug_access_privilege(struct target *target);
 static enum gdb_regno riscv013_get_reg_addr_priv_aware(struct target *target, enum gdb_regno original_rid);
 
 typedef enum {
@@ -2169,7 +2168,7 @@ static int examine(struct target *target)
 		 * so we just initialize the register cache without examining the register. 
 		 */
 		LOG_TARGET_DEBUG(target, "The harts may be in a debug-disabled state, just initialize the register cache without examining.");
-		riscv013_reg_init_cache(target);
+		//riscv013_reg_init_cache(target);
 
 	} else {
 
@@ -3297,26 +3296,13 @@ static int modify_privilege_for_virt2phys_mode(struct target *target,
 		return ERROR_FAIL;
 	}
 
-	/* Determine which registers to use based on debug access privilege */
-	enum gdb_regno dcsr_regno;
-	uint32_t prv_enable_field;
-
-	if (debug_priv == PRV_M) {
-		/* M-mode debug access - use DCSR/MSTATUS */
-		dcsr_regno = GDB_REGNO_DCSR;
-		prv_enable_field = CSR_DCSR_MPRVEN;
-	} else if (debug_priv == PRV_S) {
-		/* S-mode debug access - use SDCSR/SSTATUS */
-		dcsr_regno = GDB_REGNO_SDCSR;
-		prv_enable_field = SDCSR_DMPRV;
-	} else {
-		/* U-mode or other - not supported for privilege modification */
-		LOG_TARGET_DEBUG(target, "Debug access privilege level %d does not support privilege modification", debug_priv);
+	if (debug_priv == PRV_U)
 		return ERROR_OK;
-	}
 
-	/* Read and save debug control register (DCSR or SDCSR) */
-	if (riscv_reg_get(target, xdcsr, dcsr_regno) != ERROR_OK)
+	/* Determine which registers to use based on debug access privilege */
+	uint32_t prv_enable_field = CSR_DCSR_MPRVEN;
+
+	if (riscv013_get_register(target, xdcsr, GDB_REGNO_DCSR) != ERROR_OK)
 		return ERROR_FAIL;
 	*xdcsr_old = *xdcsr;
 
@@ -3376,7 +3362,7 @@ static int modify_privilege_for_virt2phys_mode(struct target *target,
 
 	/* Write debug control register */
 	if (*xdcsr != *xdcsr_old &&
-			riscv_reg_set(target, dcsr_regno, *xdcsr) != ERROR_OK)
+			riscv013_set_register(target, GDB_REGNO_DCSR, *xdcsr) != ERROR_OK)
 		return ERROR_FAIL;
 
 	return ERROR_OK;
@@ -5507,16 +5493,6 @@ int riscv013_get_register(struct target *target,
 		*value = set_field(*value, VIRT_PRIV_PRV, get_field(dcsr, CSR_DCSR_PRV));
 		return ERROR_OK;
 	}
-	else if (rid == GDB_REGNO_DCSR || rid == GDB_REGNO_SDCSR || rid == GDB_REGNO_UDCSR) {
-		/* For DCSR, SDCSR, and UDCSR, read the value directly, because they are used to determine the debug access privilege 
-		 * Alos, the fields in DCSR/SDCSR are not 1:1 mapped, thus must be explicitly accessed
-		 */
-		if (register_read_direct(target, value, rid) != ERROR_OK) {
-			*value = -1;
-			return ERROR_FAIL;
-		}
-		return ERROR_OK;
-	}
 
 	/* Privilege-aware register access redirection */
 	enum gdb_regno actual_rid = riscv013_get_reg_addr_priv_aware(target, rid);
@@ -5908,12 +5884,13 @@ static int riscv013_halt_go(struct target *target)
 		}
 	}
 
-	// update the debug privilege cache
-	LOG_TARGET_DEBUG(target, "Updating debug privilege cache");
-	riscv013_get_debug_access_privilege(target);
-		result = riscv013_reg_examine_all(target);
+	/* The debug access privilege is implicitly udpated during register examination*/
+	result = riscv013_reg_examine_all(target);
 		if (result != ERROR_OK)
 			return result;
+
+//	LOG_TARGET_DEBUG(target, "Updating debug privilege cache");
+//	riscv013_get_debug_access_privilege(target);
 
 	return ERROR_OK;
 }
@@ -5945,7 +5922,7 @@ static int riscv013_on_step(struct target *target)
 static enum riscv_halt_reason riscv013_halt_reason(struct target *target)
 {
 	riscv_reg_t dcsr;
-	int result = register_read_direct(target, &dcsr, GDB_REGNO_DCSR);
+	int result = riscv013_get_register(target, &dcsr, GDB_REGNO_DCSR);
 	if (result != ERROR_OK)
 		return RISCV_HALT_UNKNOWN;
 
@@ -6167,11 +6144,11 @@ static int riscv013_ack_security_faults(struct target *target)
 }
 
 /* Get the current debug access privilege level for this hart */
-/* This function determins the debug access privilege level by probing the DCSR/SDCSR registers, 
+/* This function determines the debug access privilege level by probing the DPC/SDPC registers,
  * and it does not differentiate between S/VS or U/VU mode to unify the debugger implementation
  * as much as possible.
  */
-static int riscv013_get_debug_access_privilege(struct target *target)
+int riscv013_get_debug_access_privilege(struct target *target)
 {
 	dm013_info_t *dm = get_dm(target);
 	LOG_TARGET_DEBUG(target, "dm->security_supported: %d", dm->security_supported);
@@ -6202,20 +6179,20 @@ static int riscv013_get_debug_access_privilege(struct target *target)
 			abstract_available ? "available" : "not available", info->datacount);
 	
 	if (abstract_available) {
-		/* Try to read DCSR first using abstract commands - if readable, we have M-mode privilege */
-		riscv_reg_t dcsr_value;
-		if (register_read_abstract(target, &dcsr_value, GDB_REGNO_DCSR) == ERROR_OK) {
-			LOG_TARGET_DEBUG(target, "Successfully read DCSR via abstract command, debug access at M-mode privilege");
+		/* Try to read DPC first using abstract commands - if readable, we have M-mode privilege */
+		riscv_reg_t dpc_value;
+		if (register_read_abstract(target, &dpc_value, GDB_REGNO_DPC) == ERROR_OK) {
+			LOG_TARGET_DEBUG(target, "Successfully read DPC via abstract command, debug access at M-mode privilege");
 			debug_priv = PRV_M;
 		} else {
-			/* DCSR not readable, try SDCSR - if readable, we have S-mode privilege */
-			riscv_reg_t sdcsr_value;
-			if (register_read_abstract(target, &sdcsr_value, GDB_REGNO_SDCSR) == ERROR_OK) {
-				LOG_TARGET_DEBUG(target, "Successfully read SDCSR via abstract command, debug access at S-mode ov VS-mode privilege");
+			/* DPC not readable, try SDPC - if readable, we have S-mode privilege */
+			riscv_reg_t sdpc_value;
+			if (register_read_abstract(target, &sdpc_value, GDB_REGNO_SDPC) == ERROR_OK) {
+				LOG_TARGET_DEBUG(target, "Successfully read SDPC via abstract command, debug access at S-mode privilege");
 				debug_priv = PRV_S;
 			} else {
-				/* Neither DCSR nor SDCSR readable - assume U-mode privilege */
-				LOG_TARGET_DEBUG(target, "Cannot read DCSR or SDCSR via abstract commands, assuming U-mode debug access privilege");
+				/* Neither DPC nor SDPC readable - assume U-mode privilege */
+				LOG_TARGET_DEBUG(target, "Cannot read DPC or SDPC via abstract commands, assuming U-mode debug access privilege");
 				debug_priv = PRV_U; /* U-mode privilege when neither M-mode nor S-mode debug registers are accessible */
 			}
 		}

@@ -326,6 +326,8 @@ uint32_t gdb_regno_size(const struct target *target, uint32_t regno)
 		const unsigned int csr_number = regno - GDB_REGNO_CSR0;
 		switch (csr_number) {
 			case CSR_DCSR:
+			case CSR_SDCSR:
+			case CSR_UDCSR:
 			case CSR_MVENDORID:
 			case CSR_MCOUNTINHIBIT:
 

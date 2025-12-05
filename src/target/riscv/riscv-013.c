@@ -3325,33 +3325,46 @@ static int modify_privilege_for_virt2phys_mode(struct target *target,
 		mstatus = set_field(mstatus, MSTATUS_MPP, *prv);
 		mstatus = set_field(mstatus, MSTATUS_MPV, *v);
 		mstatus = set_field(mstatus, MSTATUS_MPRV, 1);
-	if (mstatus != mstatus_old &&
+		if (mstatus != mstatus_old &&
 			riscv_reg_set(target, GDB_REGNO_MSTATUS, mstatus) != ERROR_OK)
-		return ERROR_FAIL;
+			return ERROR_FAIL;
 	} else { /* PRV_S */
 		riscv_reg_t sstatus;
 		riscv_reg_t sstatus_old;
-		riscv_reg_t hstatus;
-		riscv_reg_t hstatus_old;
+		riscv_reg_t hstatus = 0;
+		riscv_reg_t hstatus_old = 0;
+		bool hstatus_available = false;
 
 		if (riscv_reg_get(target, &sstatus, GDB_REGNO_SSTATUS) != ERROR_OK)
 			return ERROR_FAIL;
 		sstatus_old = sstatus;
-		if (riscv_reg_get(target, &hstatus, GDB_REGNO_HSTATUS) != ERROR_OK)
-			return ERROR_FAIL;
-		hstatus_old = hstatus;
+
+		/* Try to read HSTATUS register. If it's not available, skip HSTATUS operations */
+		if (riscv_reg_get(target, &hstatus, GDB_REGNO_HSTATUS) == ERROR_OK) {
+			hstatus_available = true;
+			hstatus_old = hstatus;
+			*v_old = get_field(hstatus, HSTATUS_SPV);
+		} else {
+			/* HSTATUS not available, set v_old to current v value */
+			*v_old = *v;
+		}
 
 		*prv_old = get_field(sstatus, SSTATUS_SPP);
-		*v_old = get_field(hstatus, HSTATUS_SPV);
 
-		/* Set SSTATUS.SPP <- dcsr.prv, HSTATUS.SPV <- dcsr.v, and HSTATUS.SPRV <- 1 */
+		/* Set SSTATUS.SPP <- dcsr.prv */
 		sstatus = set_field(sstatus, SSTATUS_SPP, *prv);
-		hstatus = set_field(hstatus, HSTATUS_SPV, *v);
+
+		/* Set HSTATUS.SPV <- dcsr.v only if HSTATUS is available */
+		if (hstatus_available) {
+			hstatus = set_field(hstatus, HSTATUS_SPV, *v);
+		}
 
 		if (sstatus != sstatus_old &&
 			riscv_reg_set(target, GDB_REGNO_SSTATUS, sstatus) != ERROR_OK)
 			return ERROR_FAIL;
-		if (hstatus != hstatus_old &&
+
+		/* Set HSTATUS only if it was available and changed */
+		if (hstatus_available && hstatus != hstatus_old &&
 			riscv_reg_set(target, GDB_REGNO_HSTATUS, hstatus) != ERROR_OK)
 			return ERROR_FAIL;
 	}
@@ -3424,18 +3437,17 @@ static int restore_privilege_from_virt2phys_mode(struct target *target,
 			riscv_reg_set(target, GDB_REGNO_SSTATUS, sstatus) != ERROR_OK)
 			return ERROR_FAIL;
 		
-		/* Restore HSTATUS.SPV */
+		/* Restore HSTATUS.SPV only if HSTATUS is available */
 		riscv_reg_t hstatus;
-		riscv_reg_t hstatus_old;
-		if (riscv_reg_get(target, &hstatus, GDB_REGNO_HSTATUS) != ERROR_OK)
-			return ERROR_FAIL;
-		hstatus_old = hstatus;
+		if (riscv_reg_get(target, &hstatus, GDB_REGNO_HSTATUS) == ERROR_OK) {
+			riscv_reg_t hstatus_old = hstatus;
+			hstatus = set_field(hstatus, HSTATUS_SPV, v_old);
 
-		hstatus = set_field(hstatus, HSTATUS_SPV, v_old);
-		
-		if (hstatus != hstatus_old &&
-			riscv_reg_set(target, GDB_REGNO_HSTATUS, hstatus) != ERROR_OK)
-			return ERROR_FAIL;
+			if (hstatus != hstatus_old &&
+				riscv_reg_set(target, GDB_REGNO_HSTATUS, hstatus) != ERROR_OK)
+				return ERROR_FAIL;
+		}
+		/* If HSTATUS is not available, skip it entirely - no error */
 			
 	} else {
 		/* U-mode or other - nothing to restore */
@@ -3447,7 +3459,6 @@ static int restore_privilege_from_virt2phys_mode(struct target *target,
 	if (xdcsr != xdcsr_old &&
 			riscv_reg_set(target, dcsr_regno, xdcsr_old) != ERROR_OK)
 		return ERROR_FAIL;
-
 	return ERROR_OK;
 }
 
@@ -5888,9 +5899,6 @@ static int riscv013_halt_go(struct target *target)
 	result = riscv013_reg_examine_all(target);
 		if (result != ERROR_OK)
 			return result;
-
-//	LOG_TARGET_DEBUG(target, "Updating debug privilege cache");
-//	riscv013_get_debug_access_privilege(target);
 
 	return ERROR_OK;
 }

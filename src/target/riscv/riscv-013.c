@@ -5285,15 +5285,6 @@ static int arch_state(struct target *target)
 static int riscv013_read_memory(struct target *target, target_addr_t address,
 		uint32_t size, uint32_t count, uint8_t *buffer)
 {
-	/* Check memory access privilege before proceeding */
-	int memory_priv = riscv013_get_debug_access_privilege(target);
-	if (memory_priv == PRV_UNKNOWN) {
-		LOG_TARGET_ERROR(target, "Memory read denied: debug access disallowed for all privilege levels");
-		return ERROR_FAIL;
-	}
-	
-	LOG_TARGET_DEBUG(target, "Memory read allowed with privilege level %d", memory_priv);
-	
 	const riscv_mem_access_args_t args = {
 		.address = address,
 		.read_buffer = buffer,
@@ -5308,15 +5299,6 @@ static int riscv013_read_memory(struct target *target, target_addr_t address,
 static int riscv013_write_memory(struct target *target, target_addr_t address,
 		uint32_t size, uint32_t count, const uint8_t *buffer)
 {
-	/* Check memory access privilege before proceeding */
-	int memory_priv = riscv013_get_debug_access_privilege(target);
-	if (memory_priv == PRV_UNKNOWN) {
-		LOG_TARGET_ERROR(target, "Memory write denied: debug access disallowed for all privilege levels");
-		return ERROR_FAIL;
-	}
-	
-	LOG_TARGET_DEBUG(target, "Memory write allowed with privilege level %d", memory_priv);
-	
 	const riscv_mem_access_args_t args = {
 		.address = address,
 		.write_buffer = buffer,

@@ -5729,6 +5729,60 @@ COMMAND_HANDLER(riscv_handle_security)
 	}
 }
 
+/**
+ * Parse an ISA string (e.g. "RV64IMAFDC") into a MISA register value.
+ * Returns 0 on parse failure.
+ *
+ * MISA layout:
+ *   bits [25:0]             = single-letter extension bits (A=0, B=1, ..., Z=25)
+ *   bits [XLEN-1 : XLEN-2] = MXL (1=32, 2=64, 3=128)
+ */
+static uint64_t parse_isa_string(const char *isa, int *xlen_out)
+{
+	const char *p = isa;
+
+	/* Skip optional "RV" / "rv" prefix */
+	if ((p[0] == 'R' || p[0] == 'r') && (p[1] == 'V' || p[1] == 'v'))
+		p += 2;
+
+	/* Parse base width: 32 / 64 / 128 */
+	int xlen = 0;
+	uint64_t mxl = 0;
+	if (strncmp(p, "128", 3) == 0) {
+		xlen = 128; mxl = 3; p += 3;
+	} else if (strncmp(p, "64", 2) == 0) {
+		xlen = 64; mxl = 2; p += 2;
+	} else if (strncmp(p, "32", 2) == 0) {
+		xlen = 32; mxl = 1; p += 2;
+	} else {
+		return 0;
+	}
+
+	/* Parse single-letter extensions; skip multi-letter prefixed by '_' */
+	uint64_t ext_bits = 0;
+	while (*p) {
+		if (*p == '_') {
+			/* Skip multi-letter extension name (e.g. _Zicsr, _Sdsec) */
+			p++;
+			while (*p && *p != '_')
+				p++;
+			continue;
+		}
+		char c = *p;
+		if (c >= 'A' && c <= 'Z')
+			ext_bits |= (uint64_t)1 << (c - 'A');
+		else if (c >= 'a' && c <= 'z')
+			ext_bits |= (uint64_t)1 << (c - 'a');
+		p++;
+	}
+
+	uint64_t misa = ext_bits | (mxl << (xlen - 2));
+
+	if (xlen_out)
+		*xlen_out = xlen;
+	return misa;
+}
+
 COMMAND_HANDLER(riscv_set_misa)
 {
 	struct target *target = get_current_target(CMD_CTX);
@@ -5745,23 +5799,34 @@ COMMAND_HANDLER(riscv_set_misa)
 	}
 
 	if (CMD_ARGC != 1) {
-		LOG_ERROR("Command takes exactly one argument: the MISA value");
+		LOG_ERROR("Command takes exactly one argument: a hex value or ISA string (e.g. RV64IMAFDC)");
 		return ERROR_COMMAND_SYNTAX_ERROR;
 	}
 
-	/* Parse the MISA value from the command argument */
 	uint64_t misa_value;
-	COMMAND_PARSE_NUMBER(u64, CMD_ARGV[0], misa_value);
+	const char *arg = CMD_ARGV[0];
 
-	/* Set the MISA value in the target structure */
+	/* Detect ISA string: starts with "RV"/"rv" */
+	if ((arg[0] == 'R' || arg[0] == 'r') && (arg[1] == 'V' || arg[1] == 'v')) {
+		int xlen = 0;
+		misa_value = parse_isa_string(arg, &xlen);
+		if (misa_value == 0) {
+			LOG_ERROR("Failed to parse ISA string '%s'", arg);
+			return ERROR_COMMAND_ARGUMENT_INVALID;
+		}
+		r->xlen = xlen;
+		command_print(CMD, "MISA set from ISA string '%s': 0x%016" PRIx64 ", XLEN=%d",
+			arg, misa_value, xlen);
+	} else {
+		COMMAND_PARSE_NUMBER(u64, arg, misa_value);
+		command_print(CMD, "MISA manually set to 0x%016" PRIx64 " for target %s. "
+				"The value may be overwritten if misa is readable by the target.",
+			misa_value, target_name(target));
+	}
+
 	r->misa = misa_value;
 
-	command_print(CMD, "MISA manually set to 0x%016" PRIx64 " for target %s " 
-			"the value may be overwritten if misa is readable by the target.",
-		misa_value, target_name(target));
-
-	LOG_TARGET_INFO(target, "MISA manually configured: 0x%016" PRIx64 , 
-		misa_value );
+	LOG_TARGET_INFO(target, "MISA manually configured: 0x%016" PRIx64, misa_value);
 
 	return ERROR_OK;
 }
@@ -5845,6 +5910,55 @@ COMMAND_HANDLER(riscv_set_xlen)
 	return ERROR_OK;
 }
 
+static int riscv_set_mmode_csr_override(struct command_invocation *cmd,
+		const char *csr_name, int64_t *field)
+{
+	struct target *target = get_current_target(cmd->ctx);
+	if (!target) {
+		LOG_ERROR("No target selected");
+		return ERROR_FAIL;
+	}
+	RISCV_INFO(r);
+	if (!r) {
+		LOG_ERROR("RISC-V target info not available");
+		return ERROR_FAIL;
+	}
+	if (cmd->argc != 1) {
+		if (*field >= 0)
+			command_print(cmd, "%s override: 0x%" PRIx64, csr_name, (uint64_t)*field);
+		else
+			command_print(cmd, "%s override: not set", csr_name);
+		return ERROR_OK;
+	}
+	uint64_t value;
+	COMMAND_PARSE_NUMBER(u64, cmd->argv[0], value);
+	*field = (int64_t)value;
+	command_print(cmd, "%s override set to 0x%" PRIx64 " for target %s",
+		csr_name, value, target_name(target));
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(riscv_set_mvendorid)
+{
+	struct target *target = get_current_target(CMD_CTX);
+	RISCV_INFO(r);
+	return riscv_set_mmode_csr_override(CMD, "mvendorid", &r->mvendorid_override);
+}
+
+COMMAND_HANDLER(riscv_set_marchid)
+{
+	struct target *target = get_current_target(CMD_CTX);
+	RISCV_INFO(r);
+	return riscv_set_mmode_csr_override(CMD, "marchid", &r->marchid_override);
+}
+
+COMMAND_HANDLER(riscv_set_mimpid)
+{
+	struct target *target = get_current_target(CMD_CTX);
+	RISCV_INFO(r);
+	return riscv_set_mmode_csr_override(CMD, "mimpid", &r->mimpid_override);
+}
+
 static const struct command_registration riscv_exec_command_handlers[] = {
 	{
 		.name = "dump_sample_buf",
@@ -5892,8 +6006,10 @@ static const struct command_registration riscv_exec_command_handlers[] = {
 		.name = "set_misa",
 		.handler = riscv_set_misa,
 		.mode = COMMAND_ANY,
-		.usage = "value",
+		.usage = "value|isa_string",
 		.help = "Manually set MISA register value when it's not readable due to security restrictions. "
+			"Accepts a hex value (e.g. 0x800000000014112d) or an ISA string (e.g. RV64IMAFDC). "
+			"When an ISA string is provided, XLEN is also set automatically."
 	},
 	{
 		.name = "set_secure_reg_behavior",
@@ -5912,6 +6028,30 @@ static const struct command_registration riscv_exec_command_handlers[] = {
 		.help = "Manually set XLEN (register width) for the target. "
 			"This overrides the automatic detection and is useful for secure environments "
 			"where register probing may not work reliably."
+	},
+	{
+		.name = "set_mvendorid",
+		.handler = riscv_set_mvendorid,
+		.mode = COMMAND_ANY,
+		.usage = "[value]",
+		.help = "Set override value for mvendorid CSR. Used when security restrictions "
+			"prevent reading the hardware value."
+	},
+	{
+		.name = "set_marchid",
+		.handler = riscv_set_marchid,
+		.mode = COMMAND_ANY,
+		.usage = "[value]",
+		.help = "Set override value for marchid CSR. Used when security restrictions "
+			"prevent reading the hardware value."
+	},
+	{
+		.name = "set_mimpid",
+		.handler = riscv_set_mimpid,
+		.mode = COMMAND_ANY,
+		.usage = "[value]",
+		.help = "Set override value for mimpid CSR. Used when security restrictions "
+			"prevent reading the hardware value."
 	},
 	{
 		.name = "set_mem_access",
@@ -6258,6 +6398,10 @@ static void riscv_info_init(struct target *target, struct riscv_info *r)
 	memset(r->trigger_unique_id, 0xff, sizeof(r->trigger_unique_id));
 
 	r->xlen = -1;
+
+	r->mvendorid_override = -1;
+	r->marchid_override = -1;
+	r->mimpid_override = -1;
 
 	r->virt2phys_mode = RISCV_VIRT2PHYS_MODE_SW;
 

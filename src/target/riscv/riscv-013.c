@@ -1722,6 +1722,7 @@ static int set_dcsr_ebreak(struct target *target, bool step)
 	dcsr = set_field(dcsr, CSR_DCSR_EBREAKU, config->dcsr_ebreak_fields[RISCV_MODE_U]);
 	dcsr = set_field(dcsr, CSR_DCSR_EBREAKVS, config->dcsr_ebreak_fields[RISCV_MODE_VS]);
 	dcsr = set_field(dcsr, CSR_DCSR_EBREAKVU, config->dcsr_ebreak_fields[RISCV_MODE_VU]);
+	dcsr = set_field(dcsr, CSR_DCSR_MPRVEN, CSR_DCSR_MPRVEN_ENABLED);
 	if (dcsr != original_dcsr &&
 			riscv_reg_set(target, GDB_REGNO_DCSR, dcsr) != ERROR_OK)
 		return ERROR_FAIL;
@@ -2129,10 +2130,9 @@ static int examine(struct target *target)
 		dm013_info_t *dm = get_dm(target);
 		dm->security_supported = true;
 		info->security_supported = true;
-		LOG_TARGET_DEBUG(target, "Security extension mandates HW virtual-to-physical memory address translation.");
+		LOG_TARGET_INFO(target, "Security extension detected (ALLSECURED=1 in dmstatus=0x%08x)", dmstatus);
 		RISCV_INFO(r);
 		r->virt2phys_mode = RISCV_VIRT2PHYS_MODE_HW;
-		LOG_TARGET_DEBUG(target, "Security extension initialized for %d harts", dm->hart_count);
 	}
 
 	if (dm_read(target, &info->sbcs, DM_SBCS) != ERROR_OK)
@@ -2163,13 +2163,23 @@ static int examine(struct target *target)
 	RISCV_INFO(r);
 
 
-	if ( PRV_UNKNOWN == riscv013_get_debug_access_privilege(target)) {
-		/* When the hart is in a debug-disabled state, we can't read the debug privilege level,
-		 * so we just initialize the register cache without examining the register. 
+	int debug_priv = riscv013_get_debug_access_privilege(target);
+	if ( PRV_UNKNOWN == debug_priv) {
+		/* Hart is in a debug-disabled state (security extension active, hart not halted).
+		 * We can't read registers, so initialize the cache from manually configured values.
 		 */
-		LOG_TARGET_DEBUG(target, "The harts may be in a debug-disabled state, just initialize the register cache without examining.");
-		//riscv013_reg_init_cache(target);
-
+		if (r->xlen == -1 || r->misa == 0) {
+			LOG_TARGET_ERROR(target, "Security extension detected but hart cannot be halted. "
+					"MISA and XLEN must be configured manually before init. Use: "
+					"'riscv set_misa <ISA string>' (e.g. 'riscv set_misa RV64IMAFDC') "
+					"in your OpenOCD config file before 'init'.");
+			return ERROR_FAIL;
+		}
+		LOG_TARGET_INFO(target, "Security extension active, using pre-configured MISA=0x%" PRIx64
+				" XLEN=%d", r->misa, r->xlen);
+		result = riscv013_reg_init_cache(target);
+		if (result != ERROR_OK)
+			return result;
 	} else {
 
 		enum riscv_hart_state state_at_examine_start;
@@ -5491,6 +5501,23 @@ int riscv013_get_register(struct target *target,
 	enum gdb_regno actual_rid = riscv013_get_reg_addr_priv_aware(target, rid);
 	if (actual_rid == GDB_REGNO_UNKNOWN) {
 		RISCV_INFO(r);
+
+		/* Return user-configured overrides for M-mode identity CSRs */
+		if (rid >= GDB_REGNO_CSR0 && rid <= GDB_REGNO_CSR4095) {
+			unsigned csr = rid - GDB_REGNO_CSR0;
+			int64_t ov = -1;
+			if (csr == CSR_MVENDORID && r->mvendorid_override >= 0)
+				ov = r->mvendorid_override;
+			else if (csr == CSR_MARCHID && r->marchid_override >= 0)
+				ov = r->marchid_override;
+			else if (csr == CSR_MIMPID && r->mimpid_override >= 0)
+				ov = r->mimpid_override;
+			if (ov >= 0) {
+				*value = (riscv_reg_t)ov;
+				return ERROR_OK;
+			}
+		}
+
 		switch (r->secure_reg_behavior) {
 		case RISCV_SECURE_REG_ERROR:
 			LOG_TARGET_ERROR(target, "Cannot access register %s: debug access not allowed or register not available",
@@ -5876,11 +5903,6 @@ static int riscv013_halt_go(struct target *target)
 			target->state = TARGET_UNAVAILABLE;
 		}
 	}
-
-	/* The debug access privilege is implicitly udpated during register examination*/
-	result = riscv013_reg_examine_all(target);
-		if (result != ERROR_OK)
-			return result;
 
 	return ERROR_OK;
 }

@@ -186,6 +186,13 @@ struct riscv_info {
 	int xlen;
 	/* TODO: use the value from the register cache instead. */
 	riscv_reg_t misa;
+
+	/* User-configurable overrides for M-mode CSRs that may be
+	 * inaccessible when Sdsec security restricts debug privilege.
+	 * A value of -1 means "not configured" (use hardware value). */
+	int64_t mvendorid_override;
+	int64_t marchid_override;
+	int64_t mimpid_override;
 	/* TODO: use the value from the register cache instead.
 	 * Cached value of vlenb. 0 indicates there is no vector support.
 	 * Note that you can have vector support without misa.V set, because

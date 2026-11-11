@@ -2168,7 +2168,9 @@ static int examine(struct target *target)
 		 * so we just initialize the register cache without examining the register. 
 		 */
 		LOG_TARGET_DEBUG(target, "The harts may be in a debug-disabled state, just initialize the register cache without examining.");
-		//riscv013_reg_init_cache(target);
+		result = riscv013_reg_init_cache(target);
+		if (result != ERROR_OK)
+			return result;
 
 	} else {
 
@@ -6071,7 +6073,8 @@ static int riscv013_step_or_resume_current_hart(struct target *target,
 	dmcontrol = set_field(dmcontrol, DM_DMCONTROL_RESUMEREQ, 0);
 
 	uint32_t dmstatus;
-	for (size_t i = 0; i < 256; ++i) {
+	time_t start = time(NULL);
+	do {
 		usleep(10);
 		if (dmstatus_read(target, &dmstatus, true) != ERROR_OK)
 			return ERROR_FAIL;
@@ -6084,10 +6087,10 @@ static int riscv013_step_or_resume_current_hart(struct target *target,
 
 		dm_write(target, DM_DMCONTROL, dmcontrol);
 		return ERROR_OK;
-	}
+	} while ((time(NULL) - start) < riscv_get_command_timeout_sec());
 
-	LOG_TARGET_ERROR(target, "Failed to %s. dmstatus=0x%08x",
-		step ? "single-step" : "resume", dmstatus);
+	LOG_TARGET_ERROR(target, "Failed to %s after %ds. dmstatus=0x%08x",
+		step ? "single-step" : "resume", riscv_get_command_timeout_sec(), dmstatus);
 
 	dm_write(target, DM_DMCONTROL, dmcontrol);
 	LOG_TARGET_ERROR(target,
@@ -6099,6 +6102,16 @@ static int riscv013_step_or_resume_current_hart(struct target *target,
 	LOG_TARGET_ERROR(target, "  dmstatus after cancellation=0x%08x", dmstatus);
 
 	if (step) {
+		if (get_field(dmstatus, DM_DMSTATUS_ALLRESUMEACK) &&
+				!get_field(dmstatus, DM_DMSTATUS_ALLHALTED)) {
+			/* Under Sdsec, a single-stepped instruction that enters a
+			 * debug-disallowed privilege mode remains running until it
+			 * returns to a debug-allowed mode. Mark the target running
+			 * so OpenOCD stays responsive and can poll for a later halt. */
+			target->state = TARGET_RUNNING;
+			target->debug_reason = DBG_REASON_NOTHALTED;
+			return ERROR_TIMEOUT_REACHED;
+		}
 		LOG_TARGET_ERROR(target,
 			"  trying to recover from a failed single-step, by requesting halt");
 		if (riscv_halt(target) == ERROR_OK)

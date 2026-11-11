@@ -3578,9 +3578,16 @@ static int riscv_get_gdb_reg_list_internal(struct target *target,
 		if (is_read &&
 				target->reg_cache->reg_list[i].exist &&
 				!target->reg_cache->reg_list[i].valid) {
-			if (target->reg_cache->reg_list[i].type->get(
-						&target->reg_cache->reg_list[i]) != ERROR_OK)
-				return ERROR_FAIL;
+			/*
+			 * Keep register-list discovery alive when the target is running.
+			 * Register values are fetched later (per register) by the GDB
+			 * packet handlers, which can decide how to surface access errors.
+			 */
+			if (target->state == TARGET_HALTED) {
+				if (target->reg_cache->reg_list[i].type->get(
+							&target->reg_cache->reg_list[i]) != ERROR_OK)
+					return ERROR_FAIL;
+			}
 		}
 	}
 
@@ -4291,22 +4298,27 @@ static int riscv_openocd_step_impl(struct target *target, bool current,
 
 	riscv_reg_cache_invalidate_all(target);
 
-	if (info->isrmask_mode == RISCV_ISRMASK_STEPONLY)
+	if (target->state == TARGET_HALTED &&
+			info->isrmask_mode == RISCV_ISRMASK_STEPONLY)
 		if (riscv_interrupts_restore(target, current_mstatus) != ERROR_OK) {
 			success = false;
 			LOG_TARGET_ERROR(target, "Unable to restore interrupts.");
 		}
 
 _exit:
-	if (enable_watchpoints(target, wps_to_enable) != ERROR_OK) {
-		success = false;
-		LOG_TARGET_ERROR(target, "Failed to re-enable watchpoints "
-				"after single-step.");
-	}
+	if (target->state == TARGET_HALTED) {
+		if (enable_watchpoints(target, wps_to_enable) != ERROR_OK) {
+			success = false;
+			LOG_TARGET_ERROR(target, "Failed to re-enable watchpoints "
+					"after single-step.");
+		}
 
-	if (breakpoint && (riscv_add_breakpoint(target, breakpoint) != ERROR_OK)) {
-		success = false;
-		LOG_TARGET_ERROR(target, "Unable to restore the disabled breakpoint.");
+		if (breakpoint && (riscv_add_breakpoint(target, breakpoint) != ERROR_OK)) {
+			success = false;
+			LOG_TARGET_ERROR(target, "Unable to restore the disabled breakpoint.");
+		}
+	} else if (target->state == TARGET_RUNNING && handle_callbacks) {
+		target_call_event_callbacks(target, TARGET_EVENT_RESUMED);
 	}
 
 	if (success) {

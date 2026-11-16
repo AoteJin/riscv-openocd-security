@@ -16,6 +16,7 @@ noinst_LTLIBRARIES += %D%/libriscv.la
        %D%/riscv-011.h \
        %D%/riscv-011_reg.h \
        %D%/riscv-013.h \
+       %D%/trigger_mode.h \
        %D%/riscv-013_reg.h \
        %D%/batch.c \
        %D%/program.c \

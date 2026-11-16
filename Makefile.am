@@ -28,6 +28,11 @@ dist_man_MANS =
 EXTRA_DIST =
 DISTCLEANFILES =
 
+check_PROGRAMS = testing/trigger-mode
+TESTS = $(check_PROGRAMS)
+testing_trigger_mode_SOURCES = testing/trigger-mode.c
+testing_trigger_mode_CPPFLAGS = $(AM_CPPFLAGS) -I$(srcdir)/src/target/riscv
+
 if INTERNAL_JIMTCL
 SUBDIRS += jimtcl
 DIST_SUBDIRS += jimtcl

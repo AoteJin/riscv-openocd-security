@@ -26,6 +26,7 @@
 #include "helper/list.h"
 #include "riscv.h"
 #include "riscv-013.h"
+#include "trigger_mode.h"
 #include "riscv_reg.h"
 #include "riscv-013_reg.h"
 #include "debug_defines.h"
@@ -5467,9 +5468,61 @@ struct target_type riscv013_target = {
 };
 
 /*** 0.13-specific implementations of various RISC-V helper functions. ***/
+
+int riscv013_trigger_mode_ro0(struct target *target, riscv_reg_t *mask)
+{
+	const int privilege = riscv013_get_debug_access_privilege(target);
+	if (privilege == PRV_UNKNOWN)
+		return ERROR_FAIL;
+
+	bool virtualized = false;
+	if (privilege == PRV_S && riscv_supports_extension(target, 'H')) {
+		uint32_t cmderr;
+		uint32_t command = riscv013_access_register_command(target, GDB_REGNO_HSTATUS,
+				riscv_xlen(target), AC_ACCESS_REGISTER_TRANSFER);
+		int result = riscv013_execute_abstract_command(target, command, &cmderr);
+		if (result != ERROR_OK && cmderr != CMDERR_EXCEPTION)
+			return result;
+		/* HSTATUS is accessible from HS-mode and inaccessible from VS-mode. */
+		virtualized = cmderr == CMDERR_EXCEPTION;
+	}
+	*mask = riscv_trigger_mode_ro0(privilege, virtualized);
+	return ERROR_OK;
+}
+
+static enum gdb_regno trigger_selector(enum gdb_regno requested, enum gdb_regno actual)
+{
+	if (requested == actual)
+		return GDB_REGNO_UNKNOWN;
+	if (actual >= GDB_REGNO_SIREG && actual <= GDB_REGNO_SIREG5)
+		return GDB_REGNO_SISELECT;
+	if (actual >= GDB_REGNO_UIREG && actual <= GDB_REGNO_UIREG5)
+		return GDB_REGNO_UISELECT;
+	return GDB_REGNO_UNKNOWN;
+}
+
+static int access_delegated_trigger(struct target *target, enum gdb_regno selector,
+		enum gdb_regno actual, riscv_reg_t *value, bool write)
+{
+	riscv_reg_t saved;
+	if (register_read_direct(target, &saved, selector) != ERROR_OK)
+		return ERROR_FAIL;
+
+	int result = register_write_direct(target, selector, SISELECT_TRIG);
+	if (result == ERROR_OK)
+		result = write ? register_write_direct(target, actual, *value)
+			: register_read_direct(target, value, actual);
+
+	/* Restore the interrupted indirect access even when the trigger access fails. */
+	int restore_result = register_write_direct(target, selector, saved);
+	return result == ERROR_OK ? restore_result : result;
+}
 int riscv013_get_register(struct target *target,
 		riscv_reg_t *value, enum gdb_regno rid)
 {
+	if (dm013_select_target(target) != ERROR_OK)
+		return ERROR_FAIL;
+
 	/* It would be beneficial to move this redirection to the
 	 * version-independent section, but there is a conflict:
 	 * `dcsr[5]` is `dcsr.v` in current spec, but it is `dcsr.debugint` in 0.11.
@@ -5527,7 +5580,11 @@ int riscv013_get_register(struct target *target,
 	if (dm013_select_target(target) != ERROR_OK)
 		return ERROR_FAIL;
 
-	if (register_read_direct(target, value, actual_rid) != ERROR_OK) {
+	enum gdb_regno selector = trigger_selector(rid, actual_rid);
+	int result = selector == GDB_REGNO_UNKNOWN
+		? register_read_direct(target, value, actual_rid)
+		: access_delegated_trigger(target, selector, actual_rid, value, false);
+	if (result != ERROR_OK) {
 		*value = -1;
 		return ERROR_FAIL;
 	}
@@ -5538,6 +5595,9 @@ int riscv013_get_register(struct target *target,
 int riscv013_set_register(struct target *target, enum gdb_regno rid,
 		riscv_reg_t value)
 {
+	if (dm013_select_target(target) != ERROR_OK)
+		return ERROR_FAIL;
+
 	/* Privilege-aware register access redirection */
 	enum gdb_regno actual_rid = riscv013_get_reg_addr_priv_aware(target, rid);
 	if (actual_rid == GDB_REGNO_UNKNOWN) {
@@ -5574,7 +5634,10 @@ int riscv013_set_register(struct target *target, enum gdb_regno rid,
 	if (dm013_select_target(target) != ERROR_OK)
 		return ERROR_FAIL;
 
-	return register_write_direct(target, actual_rid, value);
+	enum gdb_regno selector = trigger_selector(rid, actual_rid);
+	return selector == GDB_REGNO_UNKNOWN
+		? register_write_direct(target, actual_rid, value)
+		: access_delegated_trigger(target, selector, actual_rid, &value, true);
 }
 
 static int dm013_select_hart(struct target *target, int hart_index)
@@ -6304,6 +6367,46 @@ static enum gdb_regno riscv013_get_reg_addr_priv_aware(struct target *target, en
 			else 
 				return GDB_REGNO_UNKNOWN;
 			break;
+		case GDB_REGNO_TSELECT:
+			if (debug_priv == PRV_M)
+				return GDB_REGNO_TSELECT;
+			else if (debug_priv == PRV_S)
+				return GDB_REGNO_SIREG5;
+			else if (debug_priv == PRV_U)
+				return GDB_REGNO_UIREG5;
+			return GDB_REGNO_UNKNOWN;
+		case GDB_REGNO_TDATA1:
+			if (debug_priv == PRV_M)
+				return GDB_REGNO_TDATA1;
+			else if (debug_priv == PRV_S)
+				return GDB_REGNO_SIREG;
+			else if (debug_priv == PRV_U)
+				return GDB_REGNO_UIREG;
+			return GDB_REGNO_UNKNOWN;
+		case GDB_REGNO_TDATA2:
+			if (debug_priv == PRV_M)
+				return GDB_REGNO_TDATA2;
+			else if (debug_priv == PRV_S)
+				return GDB_REGNO_SIREG2;
+			else if (debug_priv == PRV_U)
+				return GDB_REGNO_UIREG2;
+			return GDB_REGNO_UNKNOWN;
+		case GDB_REGNO_TDATA3:
+			if (debug_priv == PRV_M)
+				return GDB_REGNO_TDATA3;
+			else if (debug_priv == PRV_S)
+				return GDB_REGNO_SIREG3;
+			else if (debug_priv == PRV_U)
+				return GDB_REGNO_UIREG3;
+			return GDB_REGNO_UNKNOWN;
+		case GDB_REGNO_TINFO:
+			if (debug_priv == PRV_M)
+				return GDB_REGNO_TINFO;
+			else if (debug_priv == PRV_S)
+				return GDB_REGNO_SIREG4;
+			else if (debug_priv == PRV_U)
+				return GDB_REGNO_UIREG4;
+			return GDB_REGNO_UNKNOWN;
 		default:
 			/* No redirection needed for this register */
 			return original_rid;

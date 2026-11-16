@@ -21,6 +21,7 @@
 #include "helper/time_support.h"
 #include "riscv.h"
 #include "riscv_reg.h"
+#include "riscv-013.h"
 #include "program.h"
 #include "gdb_regs.h"
 #include "rtos/rtos.h"
@@ -874,12 +875,11 @@ static int set_trigger(struct target *target, unsigned int idx, riscv_reg_t tdat
 
 	const uint32_t type = get_field(tdata1, CSR_TDATA1_TYPE(riscv_xlen(target)));
 	const bool is_mcontrol = type == CSR_TDATA1_TYPE_MCONTROL;
-
-	/* Determine if tdata1 supports what we need.
-	 * For mcontrol triggers, we don't care about
-	 * the value in the read-only "maskmax" field.
-	 */
-	const riscv_reg_t tdata1_ignore_mask = is_mcontrol ? CSR_MCONTROL_MASKMAX(riscv_xlen(target)) : 0;
+	const bool is_mcontrol6 = type == CSR_TDATA1_TYPE_MCONTROL6;
+	riscv_reg_t tdata1_ignore_mask = is_mcontrol ? CSR_MCONTROL_MASKMAX(riscv_xlen(target)) : 0;
+	if (is_mcontrol6 && r->dtm_version == 1 &&
+			riscv013_trigger_mode_ro0(target, &tdata1_ignore_mask) != ERROR_OK)
+		return ERROR_FAIL;
 	const bool tdata1_config_denied = (tdata1 & ~tdata1_ignore_mask) != (tdata1_rb & ~tdata1_ignore_mask);
 
 	/* Determine if tdata1.maxmask is sufficient
@@ -3493,13 +3493,6 @@ static int riscv_rw_memory(struct target *target, const riscv_mem_access_args_t 
 static int riscv_read_memory(struct target *target, target_addr_t address,
 		uint32_t size, uint32_t count, uint8_t *buffer)
 {
-	/* Check if target has its own read_memory implementation */
-	struct target_type *tt = get_target_type(target);
-	if (tt && tt->read_memory && tt->read_memory != riscv_read_memory) {
-		return tt->read_memory(target, address, size, count, buffer);
-	}
-
-	/* Use generic RISC-V implementation */
 	const riscv_mem_access_args_t args = {
 		.address = address,
 		.read_buffer = buffer,
@@ -3514,13 +3507,6 @@ static int riscv_read_memory(struct target *target, target_addr_t address,
 static int riscv_write_memory(struct target *target, target_addr_t address,
 		uint32_t size, uint32_t count, const uint8_t *buffer)
 {
-	/* Check if target has its own write_memory implementation */
-	struct target_type *tt = get_target_type(target);
-	if (tt && tt->write_memory && tt->write_memory != riscv_write_memory) {
-		return tt->write_memory(target, address, size, count, buffer);
-	}
-
-	/* Use generic RISC-V implementation */
 	const riscv_mem_access_args_t args = {
 		.address = address,
 		.write_buffer = buffer,
@@ -6550,8 +6536,8 @@ int riscv_enumerate_triggers(struct target *target)
 	 * implemented. */
 	if (result != ERROR_OK) {
 		LOG_TARGET_INFO(target, "Cannot access tselect register. "
-				"Assuming that triggers are not implemented.");
-		r->triggers_enumerated = true;
+				"Assuming that triggers are not implemented or not delegated.");
+		r->triggers_enumerated = false;
 		r->trigger_count = 0;
 		free(r->reserved_triggers);
 		r->reserved_triggers = NULL;

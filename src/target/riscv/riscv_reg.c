@@ -506,9 +506,15 @@ bool riscv_reg_impl_gdb_regno_exist(const struct target *target, uint32_t regno)
 			return reg_exists(target, GDB_REGNO_MTOPI) &&
 				riscv_xlen(target) == 32 &&
 				riscv_supports_extension(target, 'S');
-			/* Interrupts S-Mode CSRs. */
+			/* Sscsrind / Interrupts S-Mode CSRs. */
 		case CSR_SISELECT:
 		case CSR_SIREG:
+		case CSR_SIREG2:
+		case CSR_SIREG3:
+		case CSR_SIREG4:
+		case CSR_SIREG5:
+		case CSR_SIREG6:
+			return riscv_supports_extension(target, 'S');
 		case CSR_STOPI:
 			return reg_exists(target, GDB_REGNO_MTOPI) &&
 				riscv_supports_extension(target, 'S');
@@ -527,6 +533,7 @@ bool riscv_reg_impl_gdb_regno_exist(const struct target *target, uint32_t regno)
 		case CSR_HVIPRIO2:
 		case CSR_VSISELECT:
 		case CSR_VSIREG:
+			return riscv_supports_extension(target, 'H');
 		case CSR_VSTOPI:
 			return reg_exists(target, GDB_REGNO_MTOPI) &&
 				riscv_supports_extension(target, 'H');

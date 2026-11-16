@@ -787,19 +787,24 @@ static int gdb_get_packet(struct connection *connection, char *buffer, int *len)
 
 static int gdb_output_con(struct connection *connection, const char *line)
 {
-	char *hex_buffer;
-	int bin_size;
-
-	bin_size = strlen(line);
-
-	hex_buffer = malloc(bin_size * 2 + 2);
+	size_t remaining = strlen(line);
+	const size_t chunk_size = (GDB_BUFFER_SIZE - 1) / 2;
+	char *hex_buffer = malloc(MIN(remaining, chunk_size) * 2 + 2);
 	if (!hex_buffer)
 		return ERROR_GDB_BUFFER_TOO_SMALL;
 
 	hex_buffer[0] = 'O';
-	size_t pkt_len = hexify(hex_buffer + 1, (const uint8_t *)line, bin_size,
-		bin_size * 2 + 1);
-	int retval = gdb_put_packet(connection, hex_buffer, pkt_len + 1);
+	int retval;
+	do {
+		size_t count = MIN(remaining, chunk_size);
+		size_t pkt_len = hexify(hex_buffer + 1, (const uint8_t *)line, count,
+				count * 2 + 1);
+		retval = gdb_put_packet(connection, hex_buffer, pkt_len + 1);
+		if (retval != ERROR_OK)
+			break;
+		remaining -= count;
+		line += count;
+	} while (remaining);
 
 	free(hex_buffer);
 	return retval;
@@ -2854,6 +2859,13 @@ static int gdb_query_packet(struct connection *connection,
 				return ERROR_GDB_BUFFER_TOO_SMALL;
 
 			if (retval == JIM_OK) {
+				if (lenmsg > (GDB_BUFFER_SIZE - 1) / 2) {
+					int result = gdb_output_con(connection, retmsg);
+					free(retmsg);
+					if (result != ERROR_OK)
+						return result;
+					return gdb_put_packet(connection, "OK", 2);
+				}
 				if (lenmsg) {
 					char *hex_buffer = malloc(lenmsg * 2 + 1);
 					if (!hex_buffer) {

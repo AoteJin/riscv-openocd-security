@@ -24,5 +24,6 @@ uint32_t riscv013_access_register_command(struct target *target, uint32_t number
 int riscv013_execute_abstract_command(struct target *target, uint32_t command,
 		uint32_t *cmderr);
 int riscv013_get_debug_access_privilege(struct target *target);
+int riscv013_trigger_mode_ro0(struct target *target, riscv_reg_t *mask);
 
 #endif /* OPENOCD_TARGET_RISCV_RISCV_013_H */
